@@ -1001,7 +1001,7 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   ! --- Local variables
   integer              :: i, j, m, k, n_tor_tmp, n_coord_tor_tmp, jorek_model_tmp, n_var_tmp, n_order_tmp, n_period_tmp, rst_hdf5_version_tmp, i_p, p_begin
   integer              :: n_plane_tmp, n_vertex_max_tmp, n_nodes_max_tmp, n_elements_max_tmp,n_boundary_max_tmp, n_nodes_tmp, n_dof_tmp
-  integer              :: n_pieces_max_tmp, n_degrees_tmp, nref_max_tmp, n_ref_list_tmp, n_new_modes
+  integer              :: n_pieces_max_tmp, n_degrees_tmp, nref_max_tmp, n_ref_list_tmp, n_new_modes, n_values_import
   real*8               :: growth_mag, growth_kin, amplitude
   integer, allocatable :: mode_tmp(:), new_mode(:)
   real*8,  allocatable :: values_tmp(:,:,:), deltas_tmp(:,:,:)
@@ -1143,6 +1143,8 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
     write(*,*) '  As an exception, importing a 3XX restart file into model 4XX has been implemented.'
     stop
   end if
+  n_values_import = n_var_tmp
+  if (import_3xx_4xx) n_values_import = n_var
   call HDF5_integer_reading(file_id,n_order_tmp,"n_order")
   call HDF5_integer_reading(file_id,n_tor_tmp, "n_tor")
   n_tor_restart = n_tor_tmp
@@ -1215,7 +1217,7 @@ subroutine import_hdf5_restart(node_list, element_list, filename, format_rst, er
   call HDF5_integer_reading(file_id,element_list%n_elements,"n_elements")
 
   ! initialise and allocate node_list
-  call init_node_list(node_list, n_nodes_tmp, n_dof_tmp, n_var)
+  call init_node_list(node_list, n_nodes_tmp, n_dof_tmp, n_values_import)
 
 
   aux_values_read = .false.
