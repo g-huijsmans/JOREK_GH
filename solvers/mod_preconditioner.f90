@@ -32,6 +32,12 @@ module mod_preconditioner
     pc%autodistribute_modes = autodistribute_modes
     !pc%mat%row_distributed  = .not.centralize_harm_mat
 
+    pc%MPI_COMM_N = MPI_COMM_NULL
+    pc%MPI_COMM_TRANS = MPI_COMM_NULL
+    pc%MPI_COMM_MASTER = MPI_COMM_NULL
+    pc%MPI_GROUP_WORLD = MPI_GROUP_NULL
+    pc%MPI_GROUP_MASTER = MPI_GROUP_NULL
+
     if (pc%autodistribute_modes) then
       pc%n_mode_families = (n_tor + 1)/2
     else
@@ -289,57 +295,69 @@ module mod_preconditioner
 !> Deallocate arrays and reset to the default values
   subroutine reset_preconditioner(pc)
     use data_structure, only: type_PRECOND
+    use mpi_mod
     implicit none
 
     type(type_PRECOND) :: pc !, pc_def
+    integer            :: ierr
 
     if (pc%initialized) then
 
       if (pc%structured) then
 
-        deallocate(pc%rhs%val)
+        if (associated(pc%rhs%val)) deallocate(pc%rhs%val)
         pc%rhs%val => Null()
-        deallocate(pc%row_index)
+        if (associated(pc%row_index)) deallocate(pc%row_index)
         pc%row_index => Null()
-        deallocate(pc%send_counts, pc%recv_counts)
+        if (associated(pc%send_counts)) deallocate(pc%send_counts)
+        if (associated(pc%recv_counts)) deallocate(pc%recv_counts)
         pc%send_counts => Null()
         pc%recv_counts => Null()
-        deallocate(pc%send_disp, pc%recv_disp)
+        if (associated(pc%send_disp)) deallocate(pc%send_disp)
+        if (associated(pc%recv_disp)) deallocate(pc%recv_disp)
+        if (associated(pc%splt_disp)) deallocate(pc%splt_disp)
         pc%send_disp => Null()
         pc%recv_disp => Null()
-        deallocate(pc%istart, pc%ifinish)
+        pc%splt_disp => Null()
+        if (associated(pc%istart)) deallocate(pc%istart)
+        if (associated(pc%ifinish)) deallocate(pc%ifinish)
         pc%istart => Null()
         pc%ifinish => Null()
-        deallocate(pc%n_per_rank)
+        if (associated(pc%n_per_rank)) deallocate(pc%n_per_rank)
         pc%n_per_rank => Null()
 
-        deallocate(pc%mat%val)
-        deallocate(pc%mat%irn)
-        deallocate(pc%mat%jcn)
-        pc%mat%val => Null()
-        pc%mat%irn => Null()
-        pc%mat%jcn => Null()
-
-        if (pc%mat%scaled) then
-          deallocate(pc%mat%column_scaling)
-          pc%mat%column_scaling => Null()
-        endif
-
-        pc%mat%scaled = .false.
-        pc%mat%row_distributed = .false.
-        pc%mat%col_distributed = .false.
-        pc%mat%indexing = 1
-        pc%mat%block_size = 1
+        call pc%mat%reset()
         pc%structured = .false.
 
       endif
 
-      deallocate(pc%mode_families_ranks)
+      if (pc%MPI_COMM_MASTER.ne.MPI_COMM_NULL) call MPI_COMM_FREE(pc%MPI_COMM_MASTER, ierr)
+      if (pc%MPI_COMM_TRANS.ne.MPI_COMM_NULL) call MPI_COMM_FREE(pc%MPI_COMM_TRANS, ierr)
+      if (pc%MPI_COMM_N.ne.MPI_COMM_NULL) call MPI_COMM_FREE(pc%MPI_COMM_N, ierr)
+      if (pc%MPI_GROUP_MASTER.ne.MPI_GROUP_NULL) call MPI_GROUP_FREE(pc%MPI_GROUP_MASTER, ierr)
+      if (pc%MPI_GROUP_WORLD.ne.MPI_GROUP_NULL) call MPI_GROUP_FREE(pc%MPI_GROUP_WORLD, ierr)
+      pc%MPI_COMM_MASTER = MPI_COMM_NULL
+      pc%MPI_COMM_TRANS = MPI_COMM_NULL
+      pc%MPI_COMM_N = MPI_COMM_NULL
+      pc%MPI_GROUP_MASTER = MPI_GROUP_NULL
+      pc%MPI_GROUP_WORLD = MPI_GROUP_NULL
+
+      if (associated(pc%mode_families_ranks)) deallocate(pc%mode_families_ranks)
       pc%mode_families_ranks => Null()
-      deallocate(pc%mode_families_modes)
+      if (associated(pc%mode_families_modes)) deallocate(pc%mode_families_modes)
       pc%mode_families_modes => Null()
-      deallocate(pc%mode_set)
+      if (associated(pc%mode_set)) deallocate(pc%mode_set)
       pc%mode_set => Null()
+      if (associated(pc%modes_per_family)) deallocate(pc%modes_per_family)
+      if (associated(pc%ranks_per_family)) deallocate(pc%ranks_per_family)
+      if (associated(pc%rank_range)) deallocate(pc%rank_range)
+      pc%modes_per_family => Null()
+      pc%ranks_per_family => Null()
+      pc%rank_range => Null()
+#ifdef DIRECT_CONSTRUCTION
+      if (associated(pc%local_elms)) deallocate(pc%local_elms)
+      pc%local_elms => Null()
+#endif
 
       pc%initialized = .false.
 

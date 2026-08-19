@@ -2,7 +2,7 @@ module mod_sparse
   use mod_sparse_data
 
   private
-  public :: solve_sparse_system
+  public :: solve_sparse_system, solve_pc_direct
 
   contains
 
@@ -162,19 +162,7 @@ module mod_sparse
                                        l2g=solver%pc%row_index,rhs=solver%pc%rhs%val, block_size=solver%pc%mat%block_size)
       endif
 #endif
-      if (solver%library.eq.mumps) then
-#ifdef USE_MUMPS
-        call solve_mumps_all(solver%mmss, solver%pc%mat, solver%pc%rhs, solver%solve_only, tag)
-#endif
-      elseif (solver%library.eq.strumpack) then
-#ifdef USE_STRUMPACK
-        call solve_strumpack_all(solver%spss, solver%pc%mat, solver%pc%rhs, solver%solve_only, tag)
-#endif
-      elseif (solver%library.eq.pastix) then
-#if (defined USE_PASTIX) || (defined USE_PASTIX6)
-        call solve_pastix_all(solver%ptss, solver%pc%mat, solver%pc%rhs, solver%solve_only, tag)
-#endif
-      endif
+      call solve_pc_direct(solver, solver%solve_only, tag)
 
       call MPI_Barrier(a_mat%comm, ierr)
 
@@ -203,6 +191,37 @@ module mod_sparse
     endif
 
   end subroutine solve_sparse_system
+
+
+!> Solve the mode-family system held by solver%pc with the selected direct backend.
+!! With solve_only=.false. the backend performs its normal setup, analysis,
+!! factorization and solve. With solve_only=.true. it reuses retained factors.
+  subroutine solve_pc_direct(solver, solve_only, tag)
+    use mod_sparse_data, only: type_SP_SOLVER, mumps, pastix, strumpack
+
+    implicit none
+
+    type(type_SP_SOLVER), intent(inout) :: solver
+    logical, intent(in)                 :: solve_only
+    integer, intent(in)                 :: tag
+
+    external :: solve_mumps_all, solve_pastix_all, solve_strumpack_all
+
+    if (solver%library.eq.mumps) then
+#ifdef USE_MUMPS
+      call solve_mumps_all(solver%mmss, solver%pc%mat, solver%pc%rhs, solve_only, tag)
+#endif
+    elseif (solver%library.eq.strumpack) then
+#ifdef USE_STRUMPACK
+      call solve_strumpack_all(solver%spss, solver%pc%mat, solver%pc%rhs, solve_only, tag)
+#endif
+    elseif (solver%library.eq.pastix) then
+#if (defined USE_PASTIX) || (defined USE_PASTIX6)
+      call solve_pastix_all(solver%ptss, solver%pc%mat, solver%pc%rhs, solve_only, tag)
+#endif
+    endif
+
+  end subroutine solve_pc_direct
 
 
 end module mod_sparse

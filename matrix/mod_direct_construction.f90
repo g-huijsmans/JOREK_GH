@@ -2,7 +2,7 @@ module mod_direct_construction
 #ifdef DIRECT_CONSTRUCTION
 
   implicit none
-  public update_pc_mat
+  public update_pc_mat, setup_pc_structure
 
 contains
 
@@ -22,13 +22,13 @@ contains
     
     integer                            :: ierr    
     
-    if (.not.pc%structured) call set_pc_structure(pc, mhd_sim)
+    call setup_pc_structure(pc, mhd_sim)
     
     call construct_matrix(mhd_sim, pc%local_elms, pc%n_local_elms, pc%mat, pc%rhs, harmonic_matrix=.true.)
     
   end subroutine update_pc_mat
   
-  subroutine set_pc_structure(pc, mhd_sim)
+  subroutine setup_pc_structure(pc, mhd_sim)
 
     use tr_module
     use mod_integer_types
@@ -45,6 +45,8 @@ contains
     integer                            :: i_tor_min, i_tor_max
     integer                            :: i
     integer(kind=int_all)              :: ind
+
+    if (pc%structured) return
     
     if (pc%my_id.eq.0) write(*,*) "Analyzing preconditioner"
     
@@ -82,7 +84,7 @@ contains
     
     pc%structured = .true.    
     
-  end subroutine set_pc_structure
+  end subroutine setup_pc_structure
 
 #endif
 end module mod_direct_construction
