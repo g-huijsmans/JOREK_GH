@@ -543,13 +543,22 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
       do iv = 1, n_vertex_max
         inode   = element%vertex(iv)
         call make_deep_copy_node(node_list%node(inode), nodes(iv))
-        call make_deep_copy_node(aux_node_list%node(inode), aux_nodes(iv))
+        if (associated(aux_node_list)) then
+          call make_deep_copy_node(aux_node_list%node(inode), aux_nodes(iv))
+        endif
       enddo
 
     endif
 
-    call elementary_matrix_build(element, nodes, xpoint2, xcase2, R_axis, Z_axis, psi_axis,        &
-      psi_bnd, R_xpoint, Z_xpoint, omp_tid, ife, ielm, n_local_elms, node_list, a_mat%i_tor_min, a_mat%i_tor_max, aux_nodes)
+    if (associated(aux_node_list)) then
+      call elementary_matrix_build(element, nodes, xpoint2, xcase2, R_axis, Z_axis, psi_axis,      &
+        psi_bnd, R_xpoint, Z_xpoint, omp_tid, ife, ielm, n_local_elms, node_list,                  &
+        a_mat%i_tor_min, a_mat%i_tor_max, aux_nodes)
+    else
+      call elementary_matrix_build(element, nodes, xpoint2, xcase2, R_axis, Z_axis, psi_axis,      &
+        psi_bnd, R_xpoint, Z_xpoint, omp_tid, ife, ielm, n_local_elms, node_list,                  &
+        a_mat%i_tor_min, a_mat%i_tor_max)
+    endif
 
     ! Transform basis functions for the axis nodes. mhd_sim% will solve for new degrees of freedom at the axis.
     if(treat_axis .and. (nodes(1)%axis_node .or. nodes(2)%axis_node .or. nodes(3)%axis_node .or. nodes(4)%axis_node) ) then

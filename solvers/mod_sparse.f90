@@ -2,7 +2,7 @@ module mod_sparse
   use mod_sparse_data
 
   private
-  public :: solve_sparse_system, solve_pc_direct
+  public :: solve_sparse_system, solve_pc_direct, invalidate_pc_factorization
 
   contains
 
@@ -21,9 +21,6 @@ module mod_sparse
     use mod_direct_construction, only: update_pc_mat
 #else
     use mod_distribute_preconditioner, only: update_pc_mat
-#endif
-#ifdef USE_STRUMPACK
-    use mod_strumpack, only: spk_delete_factors
 #endif
 #ifdef USE_BICGSTAB
     use mod_bicgstab, only: bicgstab_driver
@@ -143,9 +140,7 @@ module mod_sparse
 
 ! Finding PC solution
       if (.not.solver%solve_only) then
-#ifdef USE_STRUMPACK
-        if ((solver%library.eq.strumpack).and.(solver%spss%analyzed)) call spk_delete_factors(solver%spss%sscp)
-#endif
+        call invalidate_pc_factorization(solver)
 #ifdef DIRECT_CONSTRUCTION
         call update_pc_mat(solver%pc,mhd_sim)
 #else
@@ -209,19 +204,44 @@ module mod_sparse
 
     if (solver%library.eq.mumps) then
 #ifdef USE_MUMPS
+      solver%mmss%equilibrium = solver%equilibrium
       call solve_mumps_all(solver%mmss, solver%pc%mat, solver%pc%rhs, solve_only, tag)
 #endif
     elseif (solver%library.eq.strumpack) then
 #ifdef USE_STRUMPACK
+      solver%spss%equilibrium = solver%equilibrium
       call solve_strumpack_all(solver%spss, solver%pc%mat, solver%pc%rhs, solve_only, tag)
 #endif
     elseif (solver%library.eq.pastix) then
 #if (defined USE_PASTIX) || (defined USE_PASTIX6)
+      solver%ptss%equilibrium = solver%equilibrium
+      solver%ptss%refine = .true.
       call solve_pastix_all(solver%ptss, solver%pc%mat, solver%pc%rhs, solve_only, tag)
 #endif
     endif
 
   end subroutine solve_pc_direct
+
+
+!> Discard backend numerical factors while retaining symbolic analysis.
+!! MUMPS and PaStiX replace their numerical factors on the next factorization.
+!! STRUMPACK requires its retained factors to be deleted explicitly.
+  subroutine invalidate_pc_factorization(solver)
+    use mod_sparse_data, only: type_SP_SOLVER, strumpack
+#ifdef USE_STRUMPACK
+    use mod_strumpack, only: spk_delete_factors
+#endif
+
+    implicit none
+
+    type(type_SP_SOLVER), intent(inout) :: solver
+
+#ifdef USE_STRUMPACK
+    if ((solver%library.eq.strumpack).and.solver%spss%analyzed) then
+      call spk_delete_factors(solver%spss%sscp)
+    endif
+#endif
+  end subroutine invalidate_pc_factorization
 
 
 end module mod_sparse
