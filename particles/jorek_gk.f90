@@ -56,6 +56,7 @@ use equil_info
 use mod_boundary, only: boundary_from_grid
 use domain
 use mod_fields
+use tr_module, only: tr_meminit
 
 !$ use omp_lib
 
@@ -134,6 +135,7 @@ electron_group = 2
 
 !call sim%initialize(skip_group_config =.true.) 
 call sim%initialize()  
+call tr_meminit(sim%my_id, sim%n_mpi)
 
 if (nsubstep_electrons < 1) then
   if (sim%my_id == 0) write(*,*) 'ERROR: nsubstep_electrons must be at least one'

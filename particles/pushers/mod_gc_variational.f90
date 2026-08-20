@@ -481,7 +481,10 @@ do i =1, n_steps
   call find_RZ_nearby(node_list, element_list, p_0%x(1), p_0%x(2), p_0%st(1), p_0%st(2), p_0%i_elm, &
                                                p_1%x(1), p_1%x(2), p_1%st(1), p_1%st(2), p_1%i_elm, ifail)
                                                
-  if (p_1%i_elm .le. 0) return
+  if (p_1%i_elm .le. 0) then
+    particle_gc%i_elm = p_1%i_elm
+    return
+  endif
     
   call fields%calc_RK4(time_1, p_1%i_elm, p_1%st, p_1%x(3), A_1, dA_1, B_1, dB_1, Bnorm_1, dBnorm_1, bn_1, dbn_1, E_1)
  !call fields%calc_RK4_analytic(p_1%x(1), p_1%x(2), p_1%x(3), A_1, dA_1, B_1, dB_1, Bnorm_1, dBnorm_1, bn_1, dbn_1, E_1)
@@ -496,7 +499,10 @@ do i =1, n_steps
 
   call find_RZ_nearby(node_list, element_list, p_0%x(1), p_0%x(2), p_0%st(1), p_0%st(2), p_0%i_elm, &
                                                p_2%x(1), p_2%x(2), p_2%st(1), p_2%st(2), p_2%i_elm, ifail)
-  if (p_2%i_elm .le. 0) return
+  if (p_2%i_elm .le. 0) then
+    particle_gc%i_elm = p_2%i_elm
+    return
+  endif
   
   call fields%calc_RK4(time_2, p_2%i_elm, p_2%st, p_2%x(3), A_2, dA_2, B_2, dB_2, Bnorm_2, dBnorm_2, bn_2, dbn_2, E_2)
  !call fields%calc_RK4_analytic(p_2%x(1), p_2%x(2), p_2%x(3), A_2, dA_2, B_2, dB_2, Bnorm_2, dBnorm_2, bn_2, dbn_2, E_2)
@@ -512,7 +518,10 @@ do i =1, n_steps
   call find_RZ_nearby(node_list, element_list, p_0%x(1), p_0%x(2), p_0%st(1), p_0%st(2), p_0%i_elm, &
                                                p_3%x(1), p_3%x(2), p_3%st(1), p_3%st(2), p_3%i_elm, ifail)
 
-  if (p_3%i_elm .le. 0) return                                             
+  if (p_3%i_elm .le. 0) then
+    particle_gc%i_elm = p_3%i_elm
+    return
+  endif
   
   call fields%calc_RK4(time_3, p_3%i_elm, p_3%st, p_3%x(3), A_3, dA_3, B_3, dB_3, Bnorm_3, dBnorm_3, bn_3, dbn_3, E_3)
  !call fields%calc_RK4_analytic(p_3%x(1), p_3%x(2), p_3%x(3), A_3, dA_3, B_3, dB_3, Bnorm_3, dBnorm_3, bn_3, dbn_3, E_3)
@@ -529,7 +538,10 @@ do i =1, n_steps
                       particle_gc%x(1), particle_gc%x(2), particle_gc%st(1), particle_gc%st(2), particle_gc%i_elm, &
                       p_0%x(1),  p_0%x(2),  p_0%st(1),  p_0%st(2),  p_0%i_elm, ifail)
 
-  if (p_0%i_elm .le. 0) return
+  if (p_0%i_elm .le. 0) then
+    particle_gc%i_elm = p_0%i_elm
+    return
+  endif
 
 enddo
 
