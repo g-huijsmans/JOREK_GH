@@ -33,7 +33,7 @@ use mod_simulation_data, only: type_MHD_SIM
 use mod_sobseq_rng
 use mod_pcg32_rng
 use mod_random_seed
-use mod_interp, only: mode_moivre, interp_RZ, interp_0, interp_00
+use mod_interp, only: mode_moivre, interp_RZ, interp_0, interp
 use mod_basisfunctions
 use basis_at_gaussian
 use mod_normalisations
@@ -44,7 +44,7 @@ use phys_module, only: part_group_configs, n_part_groups
 use phys_module, only: filter_perp, filter_hyper, filter_par, filter_perp_n0, filter_hyper_n0, filter_par_n0
 use phys_module, only: xtime, energies, mode, restart_particles, n_tht, n_leg
 use phys_module, only: T_scale_factor, B_scale_factor, t_now
-use phys_module, only: gk_adiabatic_e, gk_Pade, rst_format, ei_small_angle_scattering_Orb5, ei_small_angle_scattering_Lu
+use phys_module, only: rst_format, ei_small_angle_scattering_Orb5, ei_small_angle_scattering_Lu
 use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 use mod_export_restart
 use live_data
@@ -121,8 +121,6 @@ psi_n_end   = 1.5d0
 
 update_electric_potential = .true.
 
-!gk_adiabatic_e = .false.
-!gk_Pade        = .false.
 zero_fraction        = 0.1d0 ! create some space for new heating and fuelling particles
 
 n_particles_out      = 500   ! in steps
@@ -136,6 +134,11 @@ electron_group = 2
 
 !call sim%initialize(skip_group_config =.true.) 
 call sim%initialize()  
+
+if (nsubstep_electrons < 1) then
+  if (sim%my_id == 0) write(*,*) 'ERROR: nsubstep_electrons must be at least one'
+  call MPI_ABORT(MPI_COMM_WORLD, 1, ierr)
+endif
 
 zn_norm  = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
 rho_norm = CENTRAL_MASS * ATOMIC_MASS_UNIT * zn_norm            ! rho_SI = rho_norm * rho
@@ -154,8 +157,6 @@ n_ions            = part_group_configs(ion_group)%n_particles
 n_electrons       = part_group_configs(electron_group)%n_particles
 n_ions_local      = int(n_ions/sim%n_mpi) 
 n_electrons_local = int(n_electrons/sim%n_mpi )
-
-if (n_electrons .le. 0) gk_adiabatic_e = .true.
 
 write(*,'(i3,A,2i9.2e12.4)') sim%my_id,' number of particles : ',n_ions_local, n_electrons_local, n_ions, n_electrons
 
@@ -246,8 +247,7 @@ if (.not. restart_particles) then
                                      uniform_space=.true., uniform_space_rej_f=f_ions, &
 !                                     uniform_space=.true., uniform_space_rej_f=f_density, &
 !                                     uniform_space_rej_vars=[-2,1], charge = +1)
-                                     uniform_space_rej_vars=[-2,1], charge = +1, T_particles=T_ions)
-!                                     uniform_space_rej_vars=[-2,1], charge = +1, T_maxwell=150.d0)
+                                     uniform_space_rej_vars=[-2,1], charge = +1)
   call cpu_time(t1)
   write(*,*) ' cpu time initisalise ions : ', t1-t0
 
@@ -255,8 +255,7 @@ if (.not. restart_particles) then
                                      uniform_space=.true., uniform_space_rej_f=f_electrons, &
 !                                     uniform_space=.true., uniform_space_rej_f=f_density, &
 !                                     uniform_space_rej_vars=[-2,1], charge = -1)
-                                     uniform_space_rej_vars=[-2,1], charge = -1, T_particles=T_electrons)
-!                                     uniform_space_rej_vars=[-2,1], charge = -1, T_maxwell=300.d0)
+                                     uniform_space_rej_vars=[-2,1], charge = -1)
   call cpu_time(t2)
   write(*,*) ' cpu time initisalise electrons : ', t2-t1
 
@@ -790,14 +789,14 @@ use mod_normalisations
 use mod_project_particles
 use mod_random_seed
 use mod_sampling
-use mod_interp, only: sincosperiod_moivre, interp_00
+use mod_interp, only: sincosperiod_moivre, interp
 use mod_basisfunctions
 use mod_collisions
 use mod_particle_types, only: particle_gc_vpar, particle_kinetic_leapfrog, copy_particle_kinetic_leapfrog
 use mod_event
 use mod_pcg32_rng
-use mod_interp, only: mode_moivre, interp_RZ, interp_0, interp_00
-use mod_gc_variational, only : convert_gc_vpar_to_kinetic, copy_particle_gc_vpar, convert_gc_vpar_to_kinetic, push_gc_rk4, push_gc_rk2
+use mod_interp, only: mode_moivre, interp_RZ, interp_0
+use mod_gc_variational, only : convert_gc_vpar_to_kinetic, copy_particle_gc_vpar, push_gc_rk4
 use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 use phys_module, only: F0, CENTRAL_MASS, CENTRAL_DENSITY, ei_small_angle_scattering_Orb5, ei_small_angle_scattering_Lu
 use omp_lib
@@ -930,7 +929,6 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
     if (particle_tmp%i_elm .le. 0) already_lost = .true.
 
     call push_gc_rk4(sim%fields, particle_tmp, sim%groups(i_group)%mass, timesteps, n_steps, n_orbit) ! add B, P-orbit, and U to output of push_gc_rk4
-!    call push_gc_rk2(sim%fields, particle_tmp, sim%groups(i_group)%mass, timesteps, n_steps, n_orbit) ! add B, P-orbit, and U to output of push_gc_rk4
 
 !    call sim%fields%calc_EBpsiU(sim%time, particles(j)%i_elm, particles(j)%st, particles(j)%x(3), E, B, psi, U)
 
@@ -981,14 +979,19 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
   
       call mode_moivre(p_orbit(i)%x(3), HHZ)
 
-!      call interp_00(project_density%node_list, project_density%element_list, p_orbit(i)%i_elm, [1,2], 2, p_orbit(i)%st(1), p_orbit(i)%st(2), P2)
-      call interp_00(sim%fields%node_list, sim%fields%element_list, p_orbit(i)%i_elm, [5,6,7], 3, p_orbit(i)%st(1), p_orbit(i)%st(2), P3)
+      do m=1,3
+        call interp(sim%fields%node_list, sim%fields%element_list, p_orbit(i)%i_elm, &
+             4+m, 1, p_orbit(i)%st(1), p_orbit(i)%st(2), P3(m))
+      enddo
       zn0    = max(0.01d0,P3(1)) * zn_norm
       Te_eV  = max(P3(2) * Tev_norm / 2.d0, 10d0)   ! Temperature in sim%fields%node_list is 2*Te (should change to Te,Ti in model600)
       vpar0  = P3(3) * V_norm ! to be checked, Should be multiplied with B?
 
 ! should the background values be 3D?
-      call interp_00(project_profiles%node_list, sim%fields%element_list, p_orbit(i)%i_elm, [1,2,3,4,5,6], 6, p_orbit(i)%st(1), p_orbit(i)%st(2), P6)
+      do m=1,6
+        call interp(project_profiles%node_list, sim%fields%element_list, p_orbit(i)%i_elm, &
+             m, 1, p_orbit(i)%st(1), p_orbit(i)%st(2), P6(m))
+      enddo
       zni0   = max(0.01d0*zn_norm, P6(1))
       zne0   = max(0.01d0*zn_norm, P6(2))
       Ti0_eV = max(P6(3) / P6(1) / EL_CHG, 10d0)

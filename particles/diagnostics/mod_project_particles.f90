@@ -37,9 +37,11 @@ public projection, new_projection, sample_rhs
 public write_particle_distribution_to_vtk, write_particle_distribution_to_h5 !< public for testing reasons, please don't use directly
 
 type, extends(t_projection) :: projection
+  logical, public :: vtk_active = .true.
   contains
   procedure :: do => project
   procedure :: close_projection => close_projection
+  procedure :: set_vtk_active => set_vtk_active
 end type projection
 interface projection
   module procedure new_projection
@@ -266,7 +268,7 @@ subroutine project(this, sim, ev)
       call save_to_h5(this, sim)
     end if
   end if
-  if (allocated(this%vtk_grid)) then
+  if (allocated(this%vtk_grid) .and. this%vtk_active) then
     if (mod(index_now,nout_projection) .eq. 0) then
       call save_to_vtk(this, sim)
     end if
@@ -276,6 +278,17 @@ subroutine project(this, sim, ev)
   if (allocated(this%rhs)) this%rhs = 0.d0
   if (allocated(this%rhs_f)) deallocate(this%rhs_f)
 end subroutine project
+
+subroutine set_vtk_active(this, flag)
+  class(projection), intent(inout) :: this
+  logical, intent(in) :: flag
+
+  ! Preserve the historical output-only switch.  The current vtk_grid remains
+  ! allocated and registered; project() consults this flag at write time, in
+  ! addition to the normal nout_projection cadence.  HDF5 and projection
+  ! assembly/solution are intentionally unaffected.
+  this%vtk_active = flag
+end subroutine set_vtk_active
 
 !> Add samples to the right-hand side, stored in `this` by calling this%f(i)%f
 !> for every particle and saving the contribution multiplied by each of the basis

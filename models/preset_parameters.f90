@@ -865,7 +865,12 @@ subroutine preset_parameters
 use_particles      = .false.
 nstep_particles    = 0
 nsubstep_particles = 1
+nsubstep_electrons = 1
 tstep_particles    = 1d-9
+T_scale_factor     = 1.d0
+B_scale_factor     = 1.d0
+ei_small_angle_scattering_Orb5 = .false.
+ei_small_angle_scattering_Lu   = .false.
 filter_perp        = 0.d0
 filter_hyper       = 1.d-10
 filter_par         = 0.d0

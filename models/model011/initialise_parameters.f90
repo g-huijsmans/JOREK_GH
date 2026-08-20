@@ -199,7 +199,10 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 tgnum_T, tgnum_Ti, tgnum_Te, tgnum_vpar, tgnum_rhon,&
                 tgnum_nre, tgnum_AR, tgnum_AZ, tgnum_A3,            &
                 tstep_particles, nstep_particles,                   &
-                nsubstep_particles,                                 &
+                nsubstep_particles, nsubstep_electrons,             &
+                T_scale_factor, B_scale_factor,                     &
+                ei_small_angle_scattering_Orb5,                     &
+                ei_small_angle_scattering_Lu,                       &
                 filter_perp,    filter_hyper,    filter_par,        &
                 filter_perp_n0, filter_hyper_n0, filter_par_n0,     &
                 apply_dirichlet_proj, restart_particles,            &

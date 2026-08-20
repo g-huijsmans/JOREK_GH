@@ -10,7 +10,8 @@ implicit none
 private
 
 public proj_f, proj_f_interface, proj_one, proj_q, proj_vR, proj_vZ, proj_vPhi, proj_Ekin, proj_Ekin_keV, proj_jR, proj_jZ, proj_jPhi
-public proj_R, proj_min_rad, proj_Z,proj_v,proj_vpar,proj_mu,proj_pow
+public proj_R, proj_min_rad, proj_Z,proj_v,proj_vpar,proj_mu,proj_pow,proj_Pressure
+public kinetic_vpar_from_B
 
 interface
   function proj_f_interface(sim, group, particle)
@@ -121,23 +122,74 @@ contains
   end function proj_mu
 
   function proj_vpar(sim,group,particle)
-    use mod_particle_types, only: particle_kinetic_leapfrog
+    use mod_particle_types, only: particle_kinetic_leapfrog, particle_gc_vpar, particle_gc_Qin
     type(particle_sim), intent(in) :: sim
     integer, intent(in) :: group
     class(particle_base), intent(in) :: particle
-    type(particle_gc)    :: particle_gc_tmp
     real*8 :: proj_vpar,E(3),B(3),psi,U
+
+    ! sample_rhs excludes i_elm <= 0.  Retain the historical direct-call
+    ! behaviour for particles whose loss location is still recorded.
+    proj_vpar = 0.d0
+    if (particle%i_elm .lt. 0) return
 
     select type (p => particle)
       type is (particle_kinetic_leapfrog)
 
         call sim%fields%calc_EBpsiU(sim%time,p%i_elm,p%st,p%x(3),E,B,psi,U)
 
-        proj_vpar = dot_product(p%v,B)/sqrt(dot_product(B,B))
+        proj_vpar = kinetic_vpar_from_B(p%v,B)
+      type is (particle_gc_vpar)
+        proj_vpar = p%vpar
+      type is (particle_gc_Qin)
+        ! Qin evolves this inherited member as the physical parallel velocity.
+        ! Astar_k is canonical state and is not the requested diagnostic.
+        proj_vpar = p%vpar
       class default
-        proj_vpar = 0.d0
+        error stop 'proj_vpar: unsupported particle representation'
     end select
   end function proj_vpar
+
+  !> Physical full-orbit parallel velocity v dot B/|B| [m/s].
+  pure function kinetic_vpar_from_B(v, B)
+    real*8, intent(in) :: v(3), B(3)
+    real*8 :: kinetic_vpar_from_B, B_squared
+
+    B_squared = dot_product(B,B)
+    if (B_squared .le. tiny(B_squared)) &
+      error stop 'kinetic_vpar_from_B: parallel velocity is undefined for zero magnetic field'
+    kinetic_vpar_from_B = dot_product(v,B)/sqrt(B_squared)
+  end function kinetic_vpar_from_B
+
+  !> Scalar kinetic pressure contribution m Tr(v v)/3 per physical particle.
+  !>
+  !> particle_gc_vpar%mu is stored by the pusher as v_perp^2/(2 B), despite
+  !> the stale [eV/T] comment on that derived-type member.  Statistical weight
+  !> and finite-element basis factors are deliberately supplied by sample_rhs.
+  pure function proj_Pressure(sim, group, particle)
+    use constants, only: atomic_mass_unit
+    type(particle_sim), intent(in) :: sim
+    integer, intent(in) :: group
+    class(particle_base), intent(in) :: particle
+    real*8 :: proj_Pressure
+
+    select type (p => particle)
+    type is (particle_kinetic)
+      proj_Pressure = sim%groups(group)%mass * atomic_mass_unit * dot_product(p%v,p%v) / 3.d0
+    type is (particle_kinetic_leapfrog)
+      proj_Pressure = sim%groups(group)%mass * atomic_mass_unit * dot_product(p%v,p%v) / 3.d0
+    type is (particle_gc_vpar)
+      proj_Pressure = sim%groups(group)%mass * atomic_mass_unit * &
+                      (p%vpar**2 + 2.d0*p%mu*p%B_norm) / 3.d0
+    type is (particle_gc_Qin)
+      ! Qin evolves physical vpar and mu, but its current magnetic amplitude is
+      ! Bn_k.  Its inherited B_norm member is not refreshed by the Qin pusher.
+      proj_Pressure = sim%groups(group)%mass * atomic_mass_unit * &
+                      (p%vpar**2 + 2.d0*p%mu*p%Bn_k) / 3.d0
+    class default
+      error stop 'proj_Pressure: unsupported particle representation'
+    end select
+  end function proj_Pressure
 
   function proj_pow(sim,group,particle)
     use constants, only: el_chg

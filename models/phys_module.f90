@@ -975,6 +975,11 @@ module phys_module
   real*8  :: tstep_particles      !< the time step for the particles
   integer :: nstep_particles      !< the number of particle time steps (not used in kinetic_main)
   integer :: nsubstep_particles   !< the number of particles substeps (without projection) (not used in kinetic_main)
+  integer :: nsubstep_electrons   !< electron substeps per outer ion step in jorek_gk
+  real*8  :: T_scale_factor       !< scale imported equilibrium temperature in jorek_gk
+  real*8  :: B_scale_factor       !< scale imported equilibrium magnetic field in jorek_gk
+  logical :: ei_small_angle_scattering_Orb5 !< use the jorek_gk Orb5 electron-ion scattering branch
+  logical :: ei_small_angle_scattering_Lu   !< use the jorek_gk Lu electron-ion scattering branch
   real*8  :: filter_perp          !< particle projection smoothing parameter, poloidal plane
   real*8  :: filter_hyper         !< particle projection smoothing parameter, poloidal plane
   real*8  :: filter_par           !< particle projection smoothing parameter, parallel direction
