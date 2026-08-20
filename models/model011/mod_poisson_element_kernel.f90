@@ -3,6 +3,7 @@ module mod_poisson_element_kernel
   implicit none
   private
   public :: accumulate_poisson_blocks, scatter_poisson_harmonics
+  public :: accumulate_poisson_load_mass, apply_poisson_load_harmonics
 contains
 
   !> Add one poloidal Gaussian point to A and B in K_n = A + mode(n)^2 B.
@@ -60,4 +61,51 @@ contains
       enddo
     enddo
   end subroutine scatter_poisson_harmonics
+
+
+  !> Add one poloidal Gaussian point to the mass-like Poisson load operator.
+  !! The legacy model011 source was v*aux_rhs*R*J/(n0*1e20).
+  subroutine accumulate_poisson_load_mass(weight, big_r, xjac, value, load_mass)
+    real*8, intent(in)    :: weight, big_r, xjac
+    real*8, intent(in)    :: value(:)
+    real*8, intent(inout) :: load_mass(:,:)
+    integer               :: i, j
+
+    do j = 1, size(value)
+      do i = 1, size(value)
+        load_mass(i,j) = load_mass(i,j) + weight*big_r*xjac*value(i)*value(j)
+      enddo
+    enddo
+  end subroutine accumulate_poisson_load_mass
+
+
+  !> Apply the legacy plane-summed real-Fourier load to charge coefficients.
+  subroutine apply_poisson_load_harmonics(load_mass, charge, component_modes, &
+                                          component_types, n_plane, density_norm, element_rhs)
+    real*8, intent(in)    :: load_mass(:,:), charge(:,:), density_norm
+    integer, intent(in)   :: component_modes(:), n_plane
+    character(len=*), intent(in) :: component_types(:)
+    real*8, intent(out)   :: element_rhs(:,:)
+    integer               :: component
+    real*8                 :: toroidal_norm
+
+    if (size(charge,1).ne.size(load_mass,2)) error stop 'Invalid Poisson charge basis size.'
+    if (size(charge,2).ne.size(component_modes)) error stop 'Invalid Poisson charge harmonic count.'
+    if (size(element_rhs,1).ne.size(load_mass,1) .or. &
+        size(element_rhs,2).ne.size(component_modes)) error stop 'Invalid Poisson element RHS size.'
+    if (size(component_types).ne.size(component_modes)) error stop 'Invalid Poisson harmonic metadata.'
+    if (density_norm.le.0.d0) error stop 'Invalid Poisson density normalization.'
+
+    do component = 1, size(component_modes)
+      if (component_modes(component).eq.0) then
+        if (component_types(component).ne.'cos') error stop 'The n=0 Poisson component must be cosine.'
+        toroidal_norm = real(n_plane,8)
+      else
+        if (component_types(component).ne.'cos' .and. component_types(component).ne.'sin') &
+          error stop 'Unknown real-Fourier Poisson component type.'
+        toroidal_norm = 0.5d0*real(n_plane,8)
+      endif
+      element_rhs(:,component) = toroidal_norm*matmul(load_mass,charge(:,component))/density_norm
+    enddo
+  end subroutine apply_poisson_load_harmonics
 end module mod_poisson_element_kernel

@@ -9,6 +9,7 @@ program test_poisson_solver_cycle
   use equil_info,          only: ES
   use mod_simulation_data, only: type_MHD_SIM
   use mod_poisson_solver,  only: poisson_solve_action
+  use mod_poisson_rhs,     only: assemble_poisson_rhs
   use tr_module,           only: tr_meminit
 
   implicit none
@@ -134,7 +135,7 @@ program test_poisson_solver_cycle
                      MPI_MAX, MPI_COMM_WORLD, ierr)
   if (cross_harmonic_global.gt.1.d-13) error stop 'Poisson matrix couples harmonics.'
 
-  allocate(rhs%val(poisson%rhs_global%n), phi_first(poisson%rhs_global%n), &
+  allocate(phi_first(poisson%rhs_global%n), &
            phi_second(poisson%rhs_global%n), rhs_before_store(poisson%rhs_global%n))
   allocate(phi_old(n_tor,n_degrees,node_list%n_nodes))
   allocate(psi_before(n_tor,n_degrees,node_list%n_nodes))
@@ -146,10 +147,8 @@ program test_poisson_solver_cycle
     rho_before(:,:,inode) = node_list%node(inode)%values(:,:,var_rho)
     temperature_before(:,:,inode) = node_list%node(inode)%values(:,:,var_T)
   enddo
-  rhs%n = poisson%rhs_global%n
-  do index = 1, rhs%n
-    rhs%val(index) = sin(0.17d0*real(index,8))
-  enddo
+  call assemble_poisson_rhs(node_list,element_list,poisson%solver%pc%local_elms, &
+       poisson%solver%pc%n_local_elms,node_list,var_T,rhs)
   call poisson%set_rhs(rhs)
   call poisson%solve()
   if (.not.poisson%factorized) error stop 'First Poisson solve did not retain factors.'
@@ -189,7 +188,11 @@ program test_poisson_solver_cycle
   if (maxval(abs(poisson%rhs_global%val-rhs_before_store)).gt.0.d0) &
     error stop 'Poisson storage changed the global RHS.'
 
-  rhs%val = 2.d0*rhs%val
+  do inode = 1, node_list%n_nodes
+    node_list%node(inode)%values(:,:,var_T)=2.d0*temperature_before(:,:,inode)
+  enddo
+  call assemble_poisson_rhs(node_list,element_list,poisson%solver%pc%local_elms, &
+       poisson%solver%pc%n_local_elms,node_list,var_T,rhs)
   call poisson%set_rhs(rhs)
   call poisson%solve()
   if (.not.poisson%factorized) error stop 'Second Poisson solve lost retained factors.'
@@ -199,7 +202,11 @@ program test_poisson_solver_cycle
   changed = maxval(abs(phi_second-phi_first))
   scale_error = maxval(abs(phi_second-2.d0*phi_first))
 
-  rhs%val = 0.5d0*rhs%val
+  do inode = 1, node_list%n_nodes
+    node_list%node(inode)%values(:,:,var_T)=temperature_before(:,:,inode)
+  enddo
+  call assemble_poisson_rhs(node_list,element_list,poisson%solver%pc%local_elms, &
+       poisson%solver%pc%n_local_elms,node_list,var_T,rhs)
   call poisson%set_rhs(rhs)
   call poisson%solve()
   call poisson%gather()
