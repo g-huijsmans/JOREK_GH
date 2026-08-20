@@ -27,7 +27,8 @@ use mod_project_particles
 use mod_gc_variational
 use nodes_elements
 use mod_poisson_solver, only: poisson_solve_action
-use mod_poisson_rhs, only: assemble_poisson_rhs
+use mod_poisson_rhs, only: assemble_direct_poisson_rhs
+use mod_uncoupled_projection, only: assemble_projection_rhs
 use mod_simulation_data, only: type_MHD_SIM
 use mod_sobseq_rng
 use mod_pcg32_rng
@@ -67,7 +68,7 @@ type(count_action)                                :: counter
 type(projection), target                          :: jorek_feedback, project_profiles, project_density
 type(poisson_solve_action)                        :: poisson
 type(type_MHD_SIM), target                        :: poisson_mhd_sim
-type(type_RHS)                                    :: poisson_rhs
+type(type_RHS)                                    :: deposition_rhs, poisson_rhs
 type(type_edge_domain), allocatable, dimension(:) :: edge_domains
 type(edge_elements)                               :: D_edge
 type(write_particle_diagnostics)                  :: diag
@@ -375,7 +376,7 @@ allocate(rhs_nodes(4,sim%fields%node_list%n_nodes),rhs_nodes_local(4,sim%fields%
 node_start = 1
 node_end   = sim%fields%node_list%n_nodes
 
-if (nstep .gt. 0) then
+if (nstep .gt. 0 .and. update_electric_potential) then
   poisson_mhd_sim%my_id = sim%my_id
   poisson_mhd_sim%n_mpi = sim%n_mpi
   poisson_mhd_sim%n_tor = n_tor
@@ -479,11 +480,9 @@ do i=1, nstep_particles
 
       write(*,*) 'CHECK feedback : ',maxval(jorek_feedback%rhs),minval(jorek_feedback%rhs)
 
-      call with(sim, jorek_feedback)
-
-      call assemble_poisson_rhs(sim%fields%node_list,sim%fields%element_list, &
-           poisson%solver%pc%local_elms,poisson%solver%pc%n_local_elms, &
-           jorek_feedback%node_list,1,poisson_rhs)
+      call assemble_projection_rhs(sim%fields%node_list,sim%fields%element_list, &
+           jorek_feedback%rhs(:,:,:,:,1),deposition_rhs,MPI_COMM_WORLD)
+      call assemble_direct_poisson_rhs(deposition_rhs,poisson_rhs)
       call poisson%set_rhs(poisson_rhs)
       call poisson%solve()
       call poisson%gather()
@@ -647,6 +646,9 @@ if (nstep_particles .gt. 0) then
 
   if (update_electric_potential) then
     call poisson%finalize()
+    if (associated(deposition_rhs%val)) deallocate(deposition_rhs%val)
+    deposition_rhs%val => null()
+    deposition_rhs%n = 0
     if (associated(poisson_rhs%val)) deallocate(poisson_rhs%val)
     poisson_rhs%val => null()
     poisson_rhs%n = 0

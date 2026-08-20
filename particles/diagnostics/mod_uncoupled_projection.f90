@@ -5,8 +5,68 @@ private
 
 public assemble_system, project_only
 public assemble_projection_matrix, assemble_projection_matrix_n0 !< for testing purpouse
+public assemble_projection_rhs
 
 contains
+
+  !> Scatter an element-local particle deposition load into standard global
+  !! JOREK harmonic ordering.  This performs no projection solve and applies
+  !! no geometric, physical, or Fourier normalization.
+  subroutine assemble_projection_rhs(node_list, element_list, element_rhs, rhs_global, &
+                                     projection_comm, global_reduce)
+    use data_structure, only: type_node_list, type_element_list, type_RHS
+    use mod_parameters, only: n_tor, n_vertex_max, n_degrees
+    use mpi_mod
+    implicit none
+
+    type(type_node_list), intent(in)    :: node_list
+    type(type_element_list), intent(in) :: element_list
+    real*8, intent(in)                  :: element_rhs(:,:,:,:)
+    type(type_RHS), intent(inout)       :: rhs_global
+    integer, intent(in)                 :: projection_comm
+    logical, intent(in), optional       :: global_reduce
+    integer                             :: n_poloidal_dof, i_elm, iv, idof, itor
+    integer                             :: inode, index_node, index_global, ierr
+    logical                             :: do_reduce
+
+    if (size(element_rhs,1).ne.n_degrees .or. size(element_rhs,2).ne.n_vertex_max .or. &
+        size(element_rhs,3).ne.element_list%n_elements .or. size(element_rhs,4).ne.n_tor) &
+      error stop 'Invalid element-local projection RHS shape.'
+
+    n_poloidal_dof = 0
+    do inode = 1, node_list%n_nodes
+      n_poloidal_dof = max(n_poloidal_dof,maxval(node_list%node(inode)%index))
+    enddo
+    rhs_global%n = n_tor*n_poloidal_dof
+    if (associated(rhs_global%val)) then
+      if (size(rhs_global%val).ne.rhs_global%n) deallocate(rhs_global%val)
+    endif
+    if (.not.associated(rhs_global%val)) allocate(rhs_global%val(rhs_global%n))
+    rhs_global%val = 0.d0
+
+    do i_elm = 1, element_list%n_elements
+      do iv = 1, n_vertex_max
+        inode = element_list%element(i_elm)%vertex(iv)
+        do idof = 1, n_degrees
+          index_node = node_list%node(inode)%index(idof)
+          if (index_node.le.0) cycle
+          do itor = 1, n_tor
+            index_global = n_tor*(index_node-1)+itor
+            rhs_global%val(index_global) = rhs_global%val(index_global)+element_rhs(idof,iv,i_elm,itor)
+          enddo
+        enddo
+      enddo
+    enddo
+
+    do_reduce = .true.
+    if (present(global_reduce)) do_reduce = global_reduce
+    if (do_reduce) then
+      call MPI_AllReduce(MPI_IN_PLACE,rhs_global%val,rhs_global%n,MPI_DOUBLE_PRECISION, &
+                         MPI_SUM,projection_comm,ierr)
+    endif
+  end subroutine assemble_projection_rhs
+
+
   subroutine assemble_system(node_list, element_list, n_tor_local, i_tor_local,  &
                                   this_mpi_comm_world, this_mpi_comm_n, this_mpi_comm_master,  &
                                   a_mat, area, volume,                                         &
@@ -74,7 +134,7 @@ contains
     use mod_particle_sim, only: particle_sim
     use mod_parameters, only: n_tor, n_vertex_max, n_degrees
     use phys_module, only: n_aux_var
-    use data_structure, only: init_node
+    use data_structure, only: init_node, type_RHS
 
     use mpi_mod
     use mod_event
@@ -90,6 +150,7 @@ contains
     integer :: index_large_i, inode, index
     real*8  :: t0, t1, ostart, oend, mmm(3), mmm2(3)
     real*8,  allocatable :: my_rhs(:,:), y_tmp(:)
+    type(type_RHS) :: assembled_rhs
     integer, allocatable :: recv_counts(:), recv_disp(:)
     integer :: n_rhs, n_rhs_f, i_rhs, n_tor_local, i_tor_local, n_loc_n
     integer :: in_local, in_global, index_n, id_master_in_world, offset, i_glob1, i_glob2
@@ -145,29 +206,16 @@ contains
 
       i_start =  this%rhs_vec%n * (i_rhs-1)
           
-      do i_elm=1,this%element_list%n_elements
-
-        do i=1,n_vertex_max
-
-          inode = this%element_list%element(i_elm)%vertex(i)
-
-          do j=1,n_degrees
-
-            index_large_i = 2 * (this%node_list%node(inode)%index(j)-1) + 1 + i_start ! base index in the main matrix + rhs index
-
-            my_rhs(index_large_i,1)   = my_rhs(index_large_i,1)   + this%rhs(j, i, i_elm, 1, i_rhs) !/ this%rhs_gather_time
-            my_rhs(index_large_i+1,1) = 0.d0
-
-            do in=2, n_tor, 2
-
-              index_n = in / 2 + 1
-
-              my_rhs(index_large_i,  index_n) = my_rhs(index_large_i,  index_n) + this%rhs(j, i, i_elm, in,   i_rhs) !/ this%rhs_gather_time
-              my_rhs(index_large_i+1,index_n) = my_rhs(index_large_i+1,index_n) + this%rhs(j, i, i_elm, in+1, i_rhs) !/ this%rhs_gather_time
-
-            enddo
-          enddo
-
+      call assemble_projection_rhs(this%node_list,this%element_list,this%rhs(:,:,:,:,i_rhs), &
+                                   assembled_rhs,this%mpi_comm_world,global_reduce=.false.)
+      do index = 1, this%n_dof
+        index_large_i = 2*(index-1)+1+i_start
+        my_rhs(index_large_i,1) = assembled_rhs%val(n_tor*(index-1)+1)
+        my_rhs(index_large_i+1,1) = 0.d0
+        do in = 2, n_tor, 2
+          index_n = in/2+1
+          my_rhs(index_large_i,index_n) = assembled_rhs%val(n_tor*(index-1)+in)
+          my_rhs(index_large_i+1,index_n) = assembled_rhs%val(n_tor*(index-1)+in+1)
         enddo
       enddo
     enddo
@@ -181,33 +229,22 @@ contains
       ! Fill projection function part
       i_start =  this%rhs_vec%n * (n_rhs + i_rhs - 1)
       
-      do i_elm=1,this%element_list%n_elements
-          
-        do i=1,n_vertex_max
-        
-          inode = this%element_list%element(i_elm)%vertex(i)
-            
-          do j=1,n_degrees
-
-            index_large_i = 2*(this%node_list%node(inode)%index(j)-1) + 1 + i_start ! base index in the main matrix + rhs index
-
-            my_rhs(index_large_i,1)   = my_rhs(index_large_i,1)   + this%rhs_f(j, i, i_elm, 1, i_rhs)
-            my_rhs(index_large_i+1,1) = 0.
-
-            do in=2, n_tor, 2
-
-              index_n = in / 2 + 1
-          
-              my_rhs(index_large_i,  index_n) = my_rhs(index_large_i,  index_n) + this%rhs_f(j, i, i_elm, in,   i_rhs)
-              my_rhs(index_large_i+1,index_n) = my_rhs(index_large_i+1,index_n) + this%rhs_f(j, i, i_elm, in+1, i_rhs)
-              
-            enddo
-      
-          enddo
+      call assemble_projection_rhs(this%node_list,this%element_list,this%rhs_f(:,:,:,:,i_rhs), &
+                                   assembled_rhs,this%mpi_comm_world,global_reduce=.false.)
+      do index = 1, this%n_dof
+        index_large_i = 2*(index-1)+1+i_start
+        my_rhs(index_large_i,1) = assembled_rhs%val(n_tor*(index-1)+1)
+        my_rhs(index_large_i+1,1) = 0.d0
+        do in = 2, n_tor, 2
+          index_n = in/2+1
+          my_rhs(index_large_i,index_n) = assembled_rhs%val(n_tor*(index-1)+in)
+          my_rhs(index_large_i+1,index_n) = assembled_rhs%val(n_tor*(index-1)+in+1)
         enddo
-
       enddo
     enddo
+
+    if (associated(assembled_rhs%val)) deallocate(assembled_rhs%val)
+    assembled_rhs%val => null()
 
     ! Gather the RHS's to the root process
     ! results are gathered on the my_id_n=0 nodes

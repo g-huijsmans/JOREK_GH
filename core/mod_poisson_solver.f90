@@ -56,6 +56,7 @@ contains
 
     call this%solver%setup()
     call initialize_preconditioner(this%solver%pc, comm)
+    call validate_poisson_mode_families(this%solver%pc)
     call setup_pc_structure(this%solver%pc, mhd_sim)
 
     n_global = mhd_sim%node_list%n_dof
@@ -72,6 +73,59 @@ contains
     this%setup_done = .true.
 #endif
   end subroutine setup_poisson_solver
+
+
+  !> Check the model011 real-Fourier requirements without changing the generic
+  !! mode-family distribution.  The direct-construction implementation uses a
+  !! contiguous component interval for each family; projection preconditioners
+  !! remain free to use the more general overlapping/noncontiguous metadata.
+  subroutine validate_poisson_mode_families(pc)
+    use data_structure, only: type_PRECOND
+    use mod_parameters, only: n_tor
+    use phys_module,    only: mode, mode_type
+
+    type(type_PRECOND), intent(in) :: pc
+    integer                       :: component, family, member, previous
+    integer                       :: cos_family, sin_family
+    integer                       :: membership(n_tor)
+
+    membership=0
+    do family=1,pc%n_mode_families
+      previous=0
+      do member=1,pc%modes_per_family(family)
+        component=pc%mode_families_modes(family,member)
+        if (component.lt.1 .or. component.gt.n_tor) &
+          error stop 'Poisson mode family contains an invalid global Fourier component.'
+        membership(component)=membership(component)+1
+        if (member.gt.1 .and. component.ne.previous+1) &
+          error stop 'Direct Poisson construction requires contiguous components within a mode family.'
+        previous=component
+      enddo
+    enddo
+
+    if (any(membership.ne.1)) &
+      error stop 'Poisson mode families must contain every global Fourier component exactly once.'
+    if (mode(1).ne.0 .or. mode_type(1).ne.'cos') &
+      error stop 'Unexpected JOREK n=0 real-Fourier component convention.'
+
+    do component=2,n_tor,2
+      if (component+1.gt.n_tor) &
+        error stop 'Poisson real-Fourier storage ends with an incomplete cosine/sine pair.'
+      if (mode_type(component).ne.'cos' .or. mode_type(component+1).ne.'sin' .or. &
+          mode(component).ne.mode(component+1)) &
+        error stop 'Unexpected JOREK nonzero real-Fourier component convention.'
+      cos_family=0
+      sin_family=0
+      do family=1,pc%n_mode_families
+        if (any(pc%mode_families_modes(family,1:pc%modes_per_family(family)).eq.component)) &
+          cos_family=family
+        if (any(pc%mode_families_modes(family,1:pc%modes_per_family(family)).eq.component+1)) &
+          sin_family=family
+      enddo
+      if (cos_family.ne.sin_family) &
+        error stop 'Poisson cosine/sine components for one physical harmonic are split across mode families.'
+    enddo
+  end subroutine validate_poisson_mode_families
 
 
   !> Assemble the model-selected harmonic matrix into the persistent PC storage.
