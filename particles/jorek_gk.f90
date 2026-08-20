@@ -26,7 +26,9 @@ use mod_fields_linear
 use mod_project_particles
 use mod_gc_variational
 use nodes_elements
-use mod_jorek_timestepping
+use mod_poisson_solver, only: poisson_solve_action
+use mod_poisson_rhs, only: assemble_poisson_rhs
+use mod_simulation_data, only: type_MHD_SIM
 use mod_sobseq_rng
 use mod_pcg32_rng
 use mod_random_seed
@@ -60,10 +62,12 @@ implicit none
 
 !type(particle_sim)                                :: sim
 !type(event), dimension(:), allocatable, target    :: events
-type(event)                                       :: fieldreader, density_reader, partreader, partwriter, jorek_stepper_event
+type(event)                                       :: fieldreader, density_reader, partreader, partwriter
 type(count_action)                                :: counter
 type(projection), target                          :: jorek_feedback, project_profiles, project_density
-type(jorek_timestep_action), target               :: jorek_stepper
+type(poisson_solve_action)                        :: poisson
+type(type_MHD_SIM), target                        :: poisson_mhd_sim
+type(type_RHS)                                    :: poisson_rhs
 type(type_edge_domain), allocatable, dimension(:) :: edge_domains
 type(edge_elements)                               :: D_edge
 type(write_particle_diagnostics)                  :: diag
@@ -322,7 +326,7 @@ call with(sim, project_density)
 
 call MPI_BARRIER(MPI_COMM_WORLD, ierr)
 
-if (nstep .gt. 0) then
+if (nstep .gt. 0 .and. update_electric_potential) then
   jorek_feedback = new_projection(sim%fields%node_list, sim%fields%element_list, &
                      filter    = filter_perp,    filter_hyper    = filter_hyper,    filter_parallel    = filter_par,    &
                      filter_n0 = filter_perp_n0, filter_hyper_n0 = filter_hyper_n0, filter_parallel_n0 = filter_par_n0, &
@@ -369,17 +373,29 @@ endif
 allocate(rhs_nodes(4,sim%fields%node_list%n_nodes),rhs_nodes_local(4,sim%fields%node_list%n_nodes))
 
 node_start = 1
-node_end   = sim%fields%node_list%n_nodes 
- 
-jorek_stepper       = new_jorek_timestep_action(jorek_feedback%node_list)
-jorek_stepper_event = new_event_ptr(jorek_stepper)
-!call with(sim, jorek_stepper_event) 
+node_end   = sim%fields%node_list%n_nodes
+
+if (nstep .gt. 0) then
+  poisson_mhd_sim%my_id = sim%my_id
+  poisson_mhd_sim%n_mpi = sim%n_mpi
+  poisson_mhd_sim%n_tor = n_tor
+  poisson_mhd_sim%freeboundary = .false.
+  poisson_mhd_sim%restart = restart
+  poisson_mhd_sim%sr_n_tor = 0
+  poisson_mhd_sim%node_list => sim%fields%node_list
+  poisson_mhd_sim%element_list => sim%fields%element_list
+  poisson_mhd_sim%bnd_node_list => bnd_node_list
+  poisson_mhd_sim%bnd_elm_list => bnd_elm_list
+  poisson_mhd_sim%es => ES
+  call poisson%setup(poisson_mhd_sim,MPI_COMM_WORLD)
+  call poisson%construct_matrix()
+endif
 
 do i=1, nstep_particles
 
   particle_start_time = sim%time
 
-!  index_now = index_now + 1
+  index_now = index_now + 1
 
   jorek_feedback%rhs = 0.d0
 
@@ -465,15 +481,16 @@ do i=1, nstep_particles
 
       call with(sim, jorek_feedback)
 
-!      call with(sim, jorek_stepper_event) 
-      call with(sim, jorek_stepper) 
+      call assemble_poisson_rhs(sim%fields%node_list,sim%fields%element_list, &
+           poisson%solver%pc%local_elms,poisson%solver%pc%n_local_elms, &
+           jorek_feedback%node_list,1,poisson_rhs)
+      call poisson%set_rhs(poisson_rhs)
+      call poisson%solve()
+      call poisson%gather()
+      call poisson%store_phi()
 
       node_start = 1 
       node_end   = sim%fields%node_list%n_nodes
-
-      do j=1, node_end
-        sim%fields%node_list%node(j)%values(:,1:4,var_u) = sim%fields%node_list%node(j)%deltas(:,1:4,var_u)   ! undo the assumption in update_values that solution are deltas
-      enddo
     else
       do j=1, node_end
         sim%fields%node_list%node(j)%values(:,1:4,var_u) = 0.d0
@@ -584,9 +601,10 @@ do i=1, nstep_particles
     endif
   endif
 
-!  if (mod(index_now,n_update_poisson).eq. 0) then
-!    call jorek_feedback%update_projection(sim%fields%node_list, sim%fields%element_list)  
-!  endif
+  ! Rebuild only at the explicit outer-step cadence, after this step's density
+  ! and profile refreshes. The next physical solve factorizes the new matrix.
+  if (update_electric_potential .and. mod(index_now,n_update_poisson).eq.0) &
+    call poisson%construct_matrix()
 
   if (mod(index_now,nout).eq. 0) then
     call project_profiles%set_vtk_active(.true.)
@@ -626,6 +644,13 @@ if (nstep_particles .gt. 0) then
   call with(sim, partwriter)
 
   if ( sim%my_id .eq. 0 ) call finalize_live_data()
+
+  if (update_electric_potential) then
+    call poisson%finalize()
+    if (associated(poisson_rhs%val)) deallocate(poisson_rhs%val)
+    poisson_rhs%val => null()
+    poisson_rhs%n = 0
+  endif
   
   call sim%finalize
 
@@ -1505,4 +1530,4 @@ enddo
 call update_neighbours(node_list,element_list, force_rtree_initialize=.true.)
 
 write(*,'(A,4i8)') 'done grid_reduction :',node_list%n_nodes, element_list%n_elements,node_list%node(node_list%n_nodes)%index(4)
-end 
+end
