@@ -249,7 +249,7 @@ if (.not. restart_particles) then
                                      uniform_space=.true., uniform_space_rej_f=f_ions, &
 !                                     uniform_space=.true., uniform_space_rej_f=f_density, &
 !                                     uniform_space_rej_vars=[-2,1], charge = +1)
-                                     uniform_space_rej_vars=[-2,1], charge = +1)
+                                     uniform_space_rej_vars=[-2,1], charge = +1, T_particles=T_ions)
   call cpu_time(t1)
   write(*,*) ' cpu time initisalise ions : ', t1-t0
 
@@ -257,7 +257,7 @@ if (.not. restart_particles) then
                                      uniform_space=.true., uniform_space_rej_f=f_electrons, &
 !                                     uniform_space=.true., uniform_space_rej_f=f_density, &
 !                                     uniform_space_rej_vars=[-2,1], charge = -1)
-                                     uniform_space_rej_vars=[-2,1], charge = -1)
+                                     uniform_space_rej_vars=[-2,1], charge = -1, T_particles=T_electrons)
   call cpu_time(t2)
   write(*,*) ' cpu time initisalise electrons : ', t2-t1
 
@@ -1143,15 +1143,14 @@ end function f_electrons
 
 function T_ions(psi) result(f)
   use domain
-  use phys_module, only : xpoint, xcase
+  use phys_module, only : xpoint, xcase, central_density
   use constants,   only : MU_ZERO, EL_CHG
   use equil_info
-  use mod_normalisations, only: Tev_norm
   implicit none
   real*8, intent(in) :: psi
   real*8 :: psi_axis, psi_bnd, Z, Z_xpoint(2), psi_n
   real*8 :: zTi,dTi_dpsi,dTi_dz,dTi_dpsi2,dTi_dz2,dTi_dpsi_dz,dTi_dpsi3,dTi_dpsi_dz2, dTi_dpsi2_dz
-  real*8 :: f
+  real*8 :: f, TeV_species_norm
   logical :: xpoint_local
   integer :: xcase_local
     
@@ -1161,6 +1160,10 @@ function T_ions(psi) result(f)
   Z_xpoint = ES%Z_xpoint     
   xpoint_local = xpoint
   xcase_local  = xcase
+
+  ! temperature_i is an individual-species temperature; the global Tev_norm
+  ! contains an extra factor 1/2 for the single-temperature T = Ti + Te field.
+  TeV_species_norm = 1.d0 / (EL_CHG * MU_ZERO * central_density * 1.d20)
     
   psi_n = (psi - ES%psi_axis)/(ES%psi_bnd - ES%psi_axis)
 
@@ -1170,21 +1173,20 @@ function T_ions(psi) result(f)
 !  zTi = Ti_1 + (Ti_0-Ti_1)*(1.d0 + Ti_coef(1) * psi_n + Ti_coef(2) * psi_n**2 + Ti_coef(3) * psi_n**3) &
 !            * (0.5d0 - 0.5d0*tanh((psi_n - Ti_coef(5))/Ti_coef(4)))
 
-  f = zTi * TeV_norm
+  f = zTi * TeV_species_norm
 
 end function T_ions
 
 function T_electrons(psi) result(f)
   use domain
-  use phys_module, only : xcase, xpoint
+  use phys_module, only : xcase, xpoint, central_density
   use constants,   only : MU_ZERO, EL_CHG
   use equil_info
-  use mod_normalisations, only : Tev_norm
   implicit none
   real*8, intent(in) :: psi
   real*8 :: psi_axis, psi_bnd, Z, Z_xpoint(2), psi_n
   real*8 :: zTe,dTe_dpsi,dTe_dz,dTe_dpsi2,dTe_dz2,dTe_dpsi_dz,dTe_dpsi3,dTe_dpsi_dz2, dTe_dpsi2_dz
-  real*8 :: f
+  real*8 :: f, TeV_species_norm
   logical :: xpoint_local
   integer :: xcase_local
   
@@ -1195,6 +1197,10 @@ function T_electrons(psi) result(f)
   xpoint_local   = xpoint
   xcase_local    = xcase
 
+  ! temperature_e is an individual-species temperature; the global Tev_norm
+  ! contains an extra factor 1/2 for the single-temperature T = Ti + Te field.
+  TeV_species_norm = 1.d0 / (EL_CHG * MU_ZERO * central_density * 1.d20)
+
   psi_n = (psi - ES%psi_axis)/(ES%psi_bnd - ES%psi_axis)
 
   call temperature_e(xpoint_local, xcase_local, Z, Z_xpoint, psi, psi_axis, psi_bnd, &
@@ -1203,7 +1209,7 @@ function T_electrons(psi) result(f)
 !  zTe = Te_1 + (Te_0-Te_1)*(1.d0 + Te_coef(1) * psi_n + Te_coef(2) * psi_n**2 + Te_coef(3) * psi_n**3) &
 !            * (0.5d0 - 0.5d0*tanh((psi_n - Te_coef(5))/Te_coef(4)))
   
-  f = zTe * TeV_norm
+  f = zTe * TeV_species_norm
   
 end function T_electrons
 

@@ -33,6 +33,10 @@ module initialisers_base
       real*8, dimension(3,n), intent(in) :: gradP
       real*4 :: rej_f
     end function rej_f
+    function f_psi(psi)
+      real*8, intent(in) :: psi
+      real*8 :: f_psi
+    end function f_psi
     function real_f(n_x,x,st,time,i_elm,fields,x_min,x_max,&
     n_real_param,real_param,n_int_param,int_param)
       use mod_fields, only: fields_base
@@ -598,7 +602,7 @@ end function rejection_funct_gpdf
 
 !> Initialise particle positions in E, mu, (psi, theta|R, Z), phi, gamma (gyrophase) space.
 !> Set Psi_transform to transform from [0,1] to your desired range
-subroutine initialise_particles_H_mu_psi(particles, fields, rng_base, mass, T_maxwell, &
+subroutine initialise_particles_H_mu_psi(particles, fields, rng_base, mass, T_maxwell, T_particles, &
   Theta_transform, Psi_transform, alpha, E_max, include_vpar, uniform_space, &
   uniform_space_rej_f, uniform_space_rej_vars, cor, charge, rng_n_streams_round_off_in)
   use mod_rng
@@ -631,6 +635,7 @@ subroutine initialise_particles_H_mu_psi(particles, fields, rng_base, mass, T_ma
   type(coronal),         intent(in), optional       :: cor !< Coronal equilibrium datatype for this particle. If unset, do not alter q
   integer,               intent(in), optional       :: charge !< Use this if cor is not present
   real*8,                intent(in), optional       :: T_Maxwell !< constant Maxwellian temperature [eV]
+  procedure(f_psi),                  optional       :: T_particles !< local Maxwellian temperature as a function of psi [eV]
   logical,               intent(in), optional       :: rng_n_streams_round_off_in !< round-off the rng n_streams at 2**ceil
 
   ! Internal variables
@@ -663,7 +668,7 @@ subroutine initialise_particles_H_mu_psi(particles, fields, rng_base, mass, T_ma
   integer :: blocksize, prev_blocksize, particles_to_do_local, particles_done_local
   integer :: to_find, n_tries_now, n_found
   logical :: all_done, init_uniform_space, my_include_vpar, rng_n_streams_round_off
-  real*8  :: my_alpha
+  real*8  :: my_alpha, psi_particle
 
   rng_n_streams_round_off = .false.
   if(present(rng_n_streams_round_off_in)) rng_n_streams_round_off = rng_n_streams_round_off_in
@@ -809,7 +814,7 @@ subroutine initialise_particles_H_mu_psi(particles, fields, rng_base, mass, T_ma
     !$omp          my_include_vpar, central_density, init_uniform_space, Rbox, Zbox, uniform_space_rej_vars, n_geom, n_mhd) &
 #endif
     !$omp   private(i, psi, theta, phi, i_elm, s, t, R, Z, R_s, R_t, Z_s, Z_t, P2, &
-    !$omp           R_i, Z_i, xjac, grad_P2, u, particle_kinetic_tmp, v2, v_par,   &
+    !$omp           R_i, Z_i, xjac, grad_P2, u, particle_kinetic_tmp, v2, v_par, psi_particle, &
 #ifdef fullmhd
     !$omp           A3, AR, AZ, A3_R, A3_Z, AR_Z, AR_p, AZ_R, AZ_P, Fprof,          &
 #endif
@@ -899,6 +904,7 @@ subroutine initialise_particles_H_mu_psi(particles, fields, rng_base, mass, T_ma
         call fields%calc_F_profile(i_elm,s,t,phi,Fprof)
         inv_st_jac = 1.d0/(R_s * Z_t - R_t * Z_s)
         A3=P(1)
+        psi_particle=A3
         AR=P(2)
         AZ=P(3)
         !Derivatives of A3
@@ -918,6 +924,7 @@ subroutine initialise_particles_H_mu_psi(particles, fields, rng_base, mass, T_ma
 
 #else
         call interp_PRZ(fields%node_list, fields%element_list,i_elm,[1],1,s,t,phi,P, P_s, P_t, P_phi, R,R_s,R_t,Z,Z_s,Z_t)
+        psi_particle = P(1)
         inv_st_jac = 1.d0/(R_s * Z_t - R_t * Z_s)
         psi_R    = (  P_s(1) * Z_t - P_t(1) * Z_s ) * inv_st_jac
         psi_Z    = (- P_s(1) * R_t + P_t(1) * R_s ) * inv_st_jac
@@ -925,12 +932,14 @@ subroutine initialise_particles_H_mu_psi(particles, fields, rng_base, mass, T_ma
         B        = [+psi_Z, -psi_R, F0] / R
 
         ! 2. Calculate E and mu, save in particle
-        call interp_PRZ(fields%node_list, fields%element_list,i_elm,[6],1,s,t,phi,P, P_s, P_t, P_phi, R,R_s,R_t,Z,Z_s,Z_t)
+        call interp_PRZ(fields%node_list, fields%element_list,i_elm,[var_T],1,s,t,phi,P, P_s, P_t, P_phi, R,R_s,R_t,Z,Z_s,Z_t)
 
 
 #endif
         if (present(T_Maxwell)) then
           temp = T_Maxwell
+        elseif (present(T_particles)) then
+          temp = T_particles(psi_particle)
         else
           temp = P(1)/(2.d0*MU_ZERO*central_density*1.d20*EL_CHG) ! [eV]
 #ifdef WITH_TiTe

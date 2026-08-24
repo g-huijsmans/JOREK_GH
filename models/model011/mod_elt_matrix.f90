@@ -97,7 +97,6 @@ contains
         factor = central_mass*ATOMIC_MASS_UNIT*rho/(EL_CHG*bb2)
         psi_norm = (psi_g-psi_axis)/(psi_bnd-psi_axis)
         filter_par_centre = 0.d0
-        if (psi_norm.lt.0.64d0) filter_par_centre = 1.d0
 
         do a = 1, basis_size
           deriv_x(a) = ( y_t*deriv_s(a)-y_s*deriv_t(a))/xjac
