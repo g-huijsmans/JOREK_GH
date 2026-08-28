@@ -246,18 +246,18 @@ if (.not. restart_particles) then
 
   call cpu_time(t0)
   call initialise_particles_H_mu_psi(sim%groups(ion_group)%particles, sim%fields, sobseq_rng(), sim%groups(ion_group)%mass, &
-                                     uniform_space=.true., uniform_space_rej_f=f_ions, &
-!                                     uniform_space=.true., uniform_space_rej_f=f_density, &
-!                                     uniform_space_rej_vars=[-2,1], charge = +1)
-                                     uniform_space_rej_vars=[-2,1], charge = +1, T_particles=T_ions)
+!                                     uniform_space=.true., uniform_space_rej_f=f_ions, &
+                                     uniform_space=.true., uniform_space_rej_f=f_density, &
+                                     uniform_space_rej_vars=[-2,1], charge = +1)
+!                                     uniform_space_rej_vars=[-2,1], charge = +1, T_particles=T_ions)
   call cpu_time(t1)
   write(*,*) ' cpu time initisalise ions : ', t1-t0
 
   call initialise_particles_H_mu_psi(sim%groups(electron_group)%particles, sim%fields, sobseq_rng(), sim%groups(electron_group)%mass, &
-                                     uniform_space=.true., uniform_space_rej_f=f_electrons, &
-!                                     uniform_space=.true., uniform_space_rej_f=f_density, &
-!                                     uniform_space_rej_vars=[-2,1], charge = -1)
-                                     uniform_space_rej_vars=[-2,1], charge = -1, T_particles=T_electrons)
+!                                     uniform_space=.true., uniform_space_rej_f=f_electrons, &
+                                     uniform_space=.true., uniform_space_rej_f=f_density, &
+                                     uniform_space_rej_vars=[-2,1], charge = -1)
+!                                     uniform_space_rej_vars=[-2,1], charge = -1, T_particles=T_electrons)
   call cpu_time(t2)
   write(*,*) ' cpu time initisalise electrons : ', t2-t1
 
@@ -422,24 +422,7 @@ do i=1, nstep_particles
                               
   feedback_rhs_ions = jorek_feedback%rhs               ! the ion contribution to the right hand side
 
-!--- reservoir_E_ions      contains energy to be transferred to ions (from collisions with background ions)
-!--- reservoir_E_electrons contains energy to be transferred to ions (from collisions with background electrons)
-!--- i.e. the labels ion/electron refer to the background species
-!  call MPI_ALLREDUCE(MPI_IN_PLACE, reservoir_E_ions,      size(reservoir_E_ions),      MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
-!  call MPI_ALLREDUCE(MPI_IN_PLACE, reservoir_P_ions,      size(reservoir_P_ions),      MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
-!  call MPI_ALLREDUCE(MPI_IN_PLACE, reservoir_E_electrons, size(reservoir_E_electrons), MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
-!  call MPI_ALLREDUCE(MPI_IN_PLACE, reservoir_P_electrons, size(reservoir_P_electrons), MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
- 
-!  if (sim%my_id .eq.0) write(*,'(A,4e18.10)') 'ions : reservoir_ions (E/P)      : ',sum(reservoir_E_ions),     sum(reservoir_P_ions)
-!  if (sim%my_id .eq.0) write(*,'(A,4e18.10)') 'ions : reservoir_electrons (E/P) : ',sum(reservoir_E_electrons),sum(reservoir_P_electrons)
-!  if (sim%my_id .eq.0) write(*,'(A,4e18.10)') 'ions : reservoir_delta (E/P)     : ',sum(reservoir_delta_E),    sum(reservoir_delta_P)
-                            
-!  call with(sim, project_density)
-
- ! call empty_reservoir(sim, project_density, project_profiles, 1, 1, reservoir_E_ions,      reservoir_P_ions,      patch_list, n_patches)
- ! call empty_reservoir(sim, project_density, project_profiles, 1, 2, reservoir_E_electrons, reservoir_P_electrons, patch_list, n_patches)
-
-  write(*,*) sim%my_id, ' nsubstep_electrons, t_step_electrons : ',nsubstep_electrons
+  if (sim%my_id .eq. 0) write(*,*) ' nsubstep_electrons, t_step_electrons : ',nsubstep_electrons
 
   tstep_electrons = tstep_particles / nsubstep_electrons
 
@@ -479,8 +462,6 @@ do i=1, nstep_particles
 
     if (update_electric_potential) then
 
-      write(*,*) 'CHECK feedback : ',maxval(jorek_feedback%rhs),minval(jorek_feedback%rhs)
-
       call assemble_projection_rhs(sim%fields%node_list,sim%fields%element_list, &
            jorek_feedback%rhs(:,:,:,:,1),deposition_rhs,MPI_COMM_WORLD)
       call assemble_direct_poisson_rhs(deposition_rhs,poisson_rhs)
@@ -489,30 +470,27 @@ do i=1, nstep_particles
       call poisson%gather()
       call poisson%store_phi()
 
-      node_start = 1 
-      node_end   = sim%fields%node_list%n_nodes
+      node_start = 1 + 4 * n_tht
+      node_end   = sim%fields%node_list%n_nodes - 4 * n_tht
     else
       do j=1, node_end
         sim%fields%node_list%node(j)%values(:,1:4,var_u) = 0.d0
       enddo
     endif  
 
+    ! careful, for GENE benchmark only!
+    do j=1, sim%fields%node_list%n_nodes
+        sim%fields%node_list%node(j)%values(1,1:4,var_u) = 0.d0
+    enddo
+    do j=1, node_start
+        sim%fields%node_list%node(j)%values(:,1:4,var_u) = 0.d0
+    enddo
+    do j=node_end, sim%fields%node_list%n_nodes
+        sim%fields%node_list%node(j)%values(:,1:4,var_u) = 0.d0
+    enddo
+
   enddo ! substep electrons
 
-!--- reservoir_E_ions      contains energy to be transferred to electrons (from collisions with background ions)
-!--- reservoir_E_electrons contains energy to be transferred to electrons (from collisions with background electrons)
-!--- i.e. the labels ion/electron refer to the background species
-!  call MPI_ALLREDUCE(MPI_IN_PLACE, reservoir_E_ions,      size(reservoir_E_ions),      MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
-!  call MPI_ALLREDUCE(MPI_IN_PLACE, reservoir_P_ions,      size(reservoir_P_ions),      MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
-!  call MPI_ALLREDUCE(MPI_IN_PLACE, reservoir_E_electrons, size(reservoir_E_electrons), MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
-!  call MPI_ALLREDUCE(MPI_IN_PLACE, reservoir_P_electrons, size(reservoir_P_electrons), MPI_DOUBLE_PRECISION, MPI_SUM, MPI_COMM_WORLD, ierr)
-
-!  if (sim%my_id .eq.0) write(*,'(A,4e18.10)') 'e    : reservoir_ions (E/P)      : ',sum(reservoir_E_ions),     sum(reservoir_P_ions)
-!  if (sim%my_id .eq.0) write(*,'(A,4e18.10)') 'e    : reservoir_electrons (E/P) : ',sum(reservoir_E_electrons),sum(reservoir_P_electrons)
-!  if (sim%my_id .eq.0) write(*,'(A,4e18.10)') 'e    : reservoir_deltas (E/P)    : ',sum(reservoir_delta_E),    sum(reservoir_delta_P)
-
-!  call with(sim, project_density)
-  
   project_density%rhs = 0.d0
 
   sim%time = particle_start_time + tstep_particles * nsubstep_particles
@@ -521,32 +499,6 @@ do i=1, nstep_particles
   if (sim%my_id == 0) xtime(index_now) = sim%time
 
   if (sim%my_id == 0) write(*,*) sim%my_id,'TIMESTEPS : ',index_now,xtime(index_now),sim%time,t_now
-
-  call MPI_BARRIER(MPI_COMM_WORLD,ierr)
-  call MPI_ALLREDUCE(n_ions_lost,         total_ions_lost,       1, MPI_INTEGER,          MPI_SUM, MPI_COMM_WORLD, ierr)
-  call MPI_ALLREDUCE(n_electrons_lost,    total_electrons_lost,  1, MPI_INTEGER,          MPI_SUM, MPI_COMM_WORLD, ierr)
-  call MPI_REDUCE(energy_local_ions,             energy_total_ions,             1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-  call MPI_REDUCE(energy_local_lost_ions,        energy_total_lost_ions,        1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-  call MPI_REDUCE(energy_local_electrons,        energy_total_electrons,        1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-  call MPI_REDUCE(energy_local_lost_electrons,   energy_total_lost_electrons,   1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-  call MPI_REDUCE(momentum_local_ions,           momentum_total_ions,           1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-  call MPI_REDUCE(momentum_local_lost_ions,      momentum_total_lost_ions,      1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-  call MPI_REDUCE(momentum_local_electrons,      momentum_total_electrons,      1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-  call MPI_REDUCE(momentum_local_lost_electrons, momentum_total_lost_electrons, 1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-  call MPI_REDUCE(potential_local_ions,           potential_total_ions,           1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-  call MPI_REDUCE(potential_local_lost_ions,      potential_total_lost_ions,      1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-  call MPI_REDUCE(potential_local_electrons,      potential_total_electrons,      1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
-  call MPI_REDUCE(potential_local_lost_electrons, potential_total_lost_electrons, 1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
- 
-  if (sim%my_id .eq. 0) write(*,'(A,E14.6,2i10,20e18.10)') 'lost ions/electrons, energy : ',sim%time, total_ions_lost, total_electrons_lost, &
-                              energy_total_lost_ions,   energy_total_lost_electrons,   energy_total_ions,      energy_total_electrons,       &
-                              momentum_total_lost_ions, momentum_total_lost_electrons, momentum_total_ions,     momentum_total_electrons,    &
-                              potential_total_lost_ions, potential_total_lost_electrons, potential_total_ions, potential_total_electrons
-  if (sim%my_id .eq. 0) write(113,'(E14.6,2i10,20e18.10)') sim%time, total_ions_lost, total_electrons_lost,                                  &
-                              energy_total_lost_ions,   energy_total_lost_electrons,   energy_total_ions,      energy_total_electrons,       &
-                              momentum_total_lost_ions, momentum_total_lost_electrons, momentum_total_ions,    momentum_total_electrons,     &
-                              potential_total_lost_ions, potential_total_lost_electrons, potential_total_ions, potential_total_electrons
-
 
   if (sim%my_id .eq. 0) then
     call itg_energy(node_list,element_list,min(psi_start,psi_end),max(psi_start,psi_end),W_kin,W_tot)
