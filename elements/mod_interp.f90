@@ -10,6 +10,7 @@ public :: interp !< interp a specific harmonic in finite elements
 public :: interp_delta !< interp a specific harmonic in finite elements, of the deltas
 public :: interp_0 !< interp variable only, no derivatives at a specific position in domain
 public :: interp_0_delta !< interp variable only, no derivatives at a specific position in domain, of the deltas
+public :: interp_00 !< interp (multiple) variables, n=0 only, no derivatives at a specific position in domain
 public :: interp_RZ !< Interpolate space only
 public :: interp_RZP !< interpolate RZ at a given (s,t,phi) for a non-axisymmetric configuration 
 public :: interp_PRZ !< interp variable + pos at values or deltas
@@ -935,6 +936,33 @@ do kv = 1,n_vertex_max  ! 4 vertices
   end do
 end do
 end subroutine interp_0_single_harmonic_delta
+
+!> This subroutine interpolates some variables at a specific position within one element at a given position (s,t), for n=0 pnly
+pure subroutine interp_00(node_list, element_list, i_elm, i_v, n_v, s, t, P)
+type (type_node_list),    intent(in)  :: node_list
+type (type_element_list), intent(in)  :: element_list
+integer,                  intent(in)  :: i_elm
+integer,                  intent(in)  :: n_v, i_v(n_v)
+real*8,                   intent(in)  :: s, t
+real*8,                   intent(out) :: P(n_v)
+
+real*8  :: H(4,4)
+integer :: kv, iv, kf, m, i
+
+call basisfunctions(s,t,H)
+
+P = 0.d0
+
+do kv = 1,n_vertex_max  ! 4 vertices
+  iv = element_list%element(i_elm)%vertex(kv)  ! the node number
+  do kf = 1, n_order+1       ! 4 basis functions
+    do i = 1, n_v
+      P(i)    = P(i)   + node_list%node(iv)%values(1,kf,i_v(i)) * element_list%element(i_elm)%size(kv,kf) * H(kv,kf)
+    end do
+  end do
+end do
+end subroutine interp_00
+
 
 !> This subroutine interpolates some variables at a specific position within one element at a given position (s,t)
 pure subroutine interp_0(node_list, element_list, i_elm, i_v, n_v, s, t, phi, P)

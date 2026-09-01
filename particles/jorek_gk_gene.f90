@@ -33,7 +33,7 @@ use mod_simulation_data, only: type_MHD_SIM
 use mod_sobseq_rng
 use mod_pcg32_rng
 use mod_random_seed
-use mod_interp, only: mode_moivre, interp_RZ, interp_0, interp
+use mod_interp, only: mode_moivre, interp_RZ, interp_0, interp, interp_00
 use mod_basisfunctions
 use basis_at_gaussian
 use mod_normalisations
@@ -75,7 +75,6 @@ type(edge_elements)                               :: D_edge
 type(write_particle_diagnostics)                  :: diag
 type(type_node_list), target                      :: eq_node_list
 type(type_element_list), target                   :: eq_element_list
-class(fields_base), pointer                       :: eq_fields
 !type(type_bnd_element_list) :: bnd_elm_list !< List of boundary elements
 !type(type_bnd_node_list)    :: bnd_node_list !< List of boundary nodes.
 
@@ -165,10 +164,6 @@ write(*,'(i3,A,2i9.2e12.4)') sim%my_id,' number of particles : ',n_ions_local, n
 open(113,file='energies.txt')
 
 if (sim%my_id .eq. 0) call init_live_data()
-
-!call import_restart(eq_node_list, eq_element_list, 'equil_base', rst_format, ierr, .true.)
-!eq_fields%node_list    => eq_node_list
-!eq_fields%element_list => eq_element_list
 
 if (restart_particles) then
   deallocate(sim%groups)
@@ -933,19 +928,14 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
   
       call mode_moivre(p_orbit(i)%x(3), HHZ)
 
-      do m=1,3
-        call interp(sim%fields%node_list, sim%fields%element_list, p_orbit(i)%i_elm, &
-             4+m, 1, p_orbit(i)%st(1), p_orbit(i)%st(2), P3(m))
-      enddo
+      call interp_00(sim%fields%node_list, sim%fields%element_list, p_orbit(i)%i_elm, [5,6,7], 3, p_orbit(i)%st(1), p_orbit(i)%st(2), P3)
+
       zn0    = max(0.01d0,P3(1)) * zn_norm
       Te_eV  = max(P3(2) * Tev_norm / 2.d0, 10d0)   ! Temperature in sim%fields%node_list is 2*Te (should change to Te,Ti in model600)
       vpar0  = P3(3) * V_norm ! to be checked, Should be multiplied with B?
 
-! should the background values be 3D?
-      do m=1,6
-        call interp(project_profiles%node_list, sim%fields%element_list, p_orbit(i)%i_elm, &
-             m, 1, p_orbit(i)%st(1), p_orbit(i)%st(2), P6(m))
-      enddo
+      call interp_00(project_profiles%node_list, sim%fields%element_list, p_orbit(i)%i_elm, [1,2,3,4,5,6], 6, p_orbit(i)%st(1), p_orbit(i)%st(2), P6)
+
       zni0   = max(0.01d0*zn_norm, P6(1))
       zne0   = max(0.01d0*zn_norm, P6(2))
       Ti0_eV = max(P6(3) / P6(1) / EL_CHG, 10d0)
