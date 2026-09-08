@@ -3,11 +3,11 @@ program test_poisson_harmonics
        accumulate_poisson_nonzero_blocks,scatter_poisson_harmonics, &
        accumulate_poisson_load_mass,apply_poisson_load_harmonics
   implicit none
-  integer, parameter :: b=3,nc=5,np=64,ncase=6
+  integer, parameter :: b=3,nc=5,np=64,ncase=5
   integer :: modes(nc),icase
   character(len=3) :: types(nc)
   character(len=16) :: names(ncase)
-  real*8 :: fperp(ncase),fhyper(ncase),fpar(ncase),fperp0(ncase),fhyper0(ncase),fpar0(ncase),fcentre(ncase)
+  real*8 :: fhyper(ncase),fpar(ncase),fhyper0(ncase),fpar0(ncase),fcentre(ncase)
   real*8 :: analytic(b*nc,b*nc),sampled(b*nc,b*nc),rhs(b*nc),phi_a(b*nc),phi_s(b*nc)
   real*8 :: max_matrix_abs,max_matrix_rel,max_phi_abs,max_phi_rel,l2_phi
   real*8 :: sv(b),sdx(b),sdy(b),slap(b),shz(nc),shzp(nc),sphi
@@ -15,18 +15,16 @@ program test_poisson_harmonics
   integer :: sq,sp,si,sj,sc,sd,srow,scol
 
   modes=(/0,2,2,6,6/); types=(/'cos','cos','sin','cos','sin'/)
-  names=(/'filters off     ','perpendicular   ','hyper           ','parallel        ','n0 centre       ','full            '/)
-  fperp=(/0d0,0.17d0,0d0,0d0,0d0,0.17d0/)
-  fhyper=(/0d0,0d0,0.08d0,0d0,0d0,0.08d0/)
-  fpar=(/0d0,0d0,0d0,0.11d0,0d0,0.11d0/)
-  fperp0=(/0d0,0.13d0,0d0,0d0,0d0,0.13d0/)
-  fhyper0=(/0d0,0d0,0.07d0,0d0,0d0,0.07d0/)
-  fpar0=(/0d0,0d0,0d0,0.09d0,0d0,0.09d0/)
-  fcentre=(/0d0,0d0,0d0,0d0,1d0,1d0/)
+  names=(/'filters off     ','hyper           ','parallel        ','n0 centre       ','full            '/)
+  fhyper=(/0d0,0.08d0,0d0,0d0,0.08d0/)
+  fpar=(/0d0,0d0,0.11d0,0d0,0.11d0/)
+  fhyper0=(/0d0,0.07d0,0d0,0d0,0.07d0/)
+  fpar0=(/0d0,0d0,0.09d0,0d0,0.09d0/)
+  fcentre=(/0d0,0d0,0d0,1d0,1d0/)
 
   do icase=1,ncase
-    call build_analytic(fperp0(icase),fhyper0(icase),fpar0(icase)+fcentre(icase), &
-         fperp(icase),fhyper(icase),fpar(icase),analytic)
+    call build_analytic(fhyper0(icase),fpar0(icase)+fcentre(icase), &
+         fhyper(icase),fpar(icase),analytic)
     sampled=0d0; stwopi=2d0*acos(-1d0)
     do sq=1,3
       call point_data(sq,sv,sdx,sdy,slap,sw,sr,sjac,sfactor,sbb2,sf0,spsix,spsiy)
@@ -41,14 +39,14 @@ program test_poisson_harmonics
                 if (modes(sc).ne.modes(sd)) cycle
                 srow=(si-1)*nc+sc; scol=(sj-1)*nc+sd
                 if (modes(sc).eq.0) then
-                  sintegrand=(sfactor+fperp0(icase))*(sdx(si)*sdx(sj)+sdy(si)*sdy(sj)) &
+                  sintegrand=sfactor*(sdx(si)*sdx(sj)+sdy(si)*sdy(sj)) &
                        +fhyper0(icase)*slap(si)*slap(sj) &
                        +(fpar0(icase)+fcentre(icase))*((sdx(si)*spsiy-sdy(si)*spsix)/sr) &
                        *((sdx(sj)*spsiy-sdy(sj)*spsix)/sr)/sbb2
                 else
                   sdvi=(sf0/sr*sv(si)*shzp(sc)+(sdx(si)*spsiy-sdy(si)*spsix)*shz(sc))/sr
                   sdpj=(sf0/sr*sv(sj)*shzp(sd)+(sdx(sj)*spsiy-sdy(sj)*spsix)*shz(sd))/sr
-                  sintegrand=(sfactor+fperp(icase))*(sdx(si)*sdx(sj)+sdy(si)*sdy(sj))*shz(sc)*shz(sd) &
+                  sintegrand=sfactor*(sdx(si)*sdx(sj)+sdy(si)*sdy(sj))*shz(sc)*shz(sd) &
                        +fhyper(icase)*slap(si)*slap(sj)*shz(sc)*shz(sd) &
                        +sfactor*sv(si)*sv(sj)*shzp(sc)*shzp(sd)/sr**2 &
                        +(fpar(icase)-sfactor)*sdvi*sdpj/sbb2
@@ -63,7 +61,7 @@ program test_poisson_harmonics
     call matrix_errors(analytic,sampled,max_matrix_abs,max_matrix_rel)
     write(*,'(A,1X,A,2(1X,ES12.4))') 'matrix',trim(names(icase)),max_matrix_abs,max_matrix_rel
     if (max_matrix_abs.gt.2.d-12 .or. max_matrix_rel.gt.2.d-12) &
-      error stop 'Original sampled and analytic Poisson matrices differ.'
+      error stop 'Sampled and analytic Poisson matrices differ.'
   enddo
 
   rhs=(/0d0,0.3d0,-0.2d0,0.1d0,0.4d0, 0d0,-0.1d0,0.2d0,0.5d0,-0.3d0, &
@@ -91,8 +89,8 @@ contains
     bb2=(f0*f0+psix*psix+psiy*psiy)/r**2
   end subroutine point_data
 
-  non_recursive subroutine build_analytic(fp0,fh0,fq0,fp,fh,fq,matrix)
-    real*8,intent(in) :: fp0,fh0,fq0,fp,fh,fq
+  non_recursive subroutine build_analytic(fh0,fq0,fh,fq,matrix)
+    real*8,intent(in) :: fh0,fq0,fh,fq
     real*8,intent(out) :: matrix(:,:)
     real*8 :: n0(b,b),a(b,b),bk(b,b),c(b,b),value(b),dx(b),dy(b),lap(b)
     real*8 :: weight,r,jac,factor,bb2,f0,psix,psiy
@@ -100,9 +98,9 @@ contains
     n0=0d0; a=0d0; bk=0d0; c=0d0
     do q=1,3
       call point_data(q,value,dx,dy,lap,weight,r,jac,factor,bb2,f0,psix,psiy)
-      call accumulate_poisson_n0_block(weight,r,jac,factor,bb2,psix,psiy,fp0,fh0,fq0, &
+      call accumulate_poisson_n0_block(weight,r,jac,factor,bb2,psix,psiy,fh0,fq0, &
            value,dx,dy,lap,n0)
-      call accumulate_poisson_nonzero_blocks(weight,r,jac,factor,bb2,f0,psix,psiy,fp,fh,fq, &
+      call accumulate_poisson_nonzero_blocks(weight,r,jac,factor,bb2,f0,psix,psiy,fh,fq, &
            value,dx,dy,lap,a,bk,c)
     enddo
     matrix=0d0

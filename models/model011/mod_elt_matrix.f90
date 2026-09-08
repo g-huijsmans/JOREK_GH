@@ -10,8 +10,8 @@ contains
     use data_structure,            only: type_element, type_node
     use gauss,                     only: n_gauss, wgauss
     use basis_at_gaussian,         only: H, H_s, H_t, H_ss, H_st, H_tt
-    use phys_module,               only: F0, central_mass, filter_perp, filter_hyper, filter_par, &
-                                         filter_perp_n0, filter_hyper_n0, filter_par_n0, mode, mode_type, &
+    use phys_module,               only: F0, central_mass, filter_gk_hyper, filter_gk_par, &
+                                         filter_gk_hyper_n0, filter_gk_par_n0, mode, mode_type, &
                                          central_density
     use mod_poisson_element_kernel, only: accumulate_poisson_n0_block, &
                                           accumulate_poisson_nonzero_blocks, scatter_poisson_harmonics, &
@@ -116,10 +116,10 @@ contains
 
         weight = wgauss(ms)*wgauss(mt)
         call accumulate_poisson_n0_block(weight,big_r,xjac,factor,bb2,psi_x,psi_y, &
-             filter_perp_n0,filter_hyper_n0,filter_par_n0+filter_par_centre, &
+            filter_gk_hyper_n0,filter_gk_par_n0+filter_par_centre, &
              value,deriv_x,deriv_y,laplace_star,block_n0)
         call accumulate_poisson_nonzero_blocks(weight,big_r,xjac,factor,bb2,F0,psi_x,psi_y, &
-             filter_perp,filter_hyper,filter_par,value,deriv_x,deriv_y,laplace_star, &
+             filter_gk_hyper,filter_gk_par,value,deriv_x,deriv_y,laplace_star, &
              block_a,block_b,block_c)
         if (gk_adiabatic) then
           if (temperature.le.0.d0) error stop 'Non-positive electron temperature in adiabatic GK Poisson matrix.'

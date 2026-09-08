@@ -173,7 +173,7 @@ do i=1,size(sim%groups)
   if (electron_group.eq.0 .and. sim%groups(i)%Z.lt.0 .and. sim%groups(i)%n_particles.gt.0.d0) electron_group=i
 enddo
 if (ion_group.eq.0) error stop 'GK Poisson requires a kinetic ion species.'
-gk_adiabatic = electron_group.eq.0
+gk_adiabatic           = electron_group.eq.0
 profile_electron_group = electron_group
 if (gk_adiabatic) profile_electron_group = ion_group
 
@@ -189,10 +189,10 @@ if (.not.gk_adiabatic .and. nsubstep_electrons.lt.1) then
   call MPI_ABORT(MPI_COMM_WORLD, 1, ierr)
 endif
 
-n_ions = sim%groups(ion_group)%n_particles
+n_ions      = sim%groups(ion_group)%n_particles
 n_electrons = 0.d0
-if (.not.gk_adiabatic) n_electrons = sim%groups(electron_group)%n_particles
-n_ions_local = int(n_ions/sim%n_mpi)
+if (.not. gk_adiabatic) n_electrons = sim%groups(electron_group)%n_particles
+n_ions_local     = int(n_ions/sim%n_mpi)
 n_electrons_local = int(n_electrons/sim%n_mpi)
 write(*,'(i3,A,2i9.2e12.4)') sim%my_id,' number of particles : ',n_ions_local, n_electrons_local, n_ions, n_electrons
 
@@ -255,8 +255,6 @@ if (.not. restart_particles) then
     if (.not.gk_adiabatic) write(*,'(A,e12.4)') ' electron mass : ',sim%groups(electron_group)%mass
   endif
 
-!  allocate(particle_gc_vpar::sim%groups(ion_group)%particles(n_ions_local))
-!  allocate(particle_gc_vpar::sim%groups(electron_group)%particles(n_electrons_local))
   call allocate_particles_for_sim(sim) ! populate the particle arrays in the particle groups
 
   call cpu_time(t0)

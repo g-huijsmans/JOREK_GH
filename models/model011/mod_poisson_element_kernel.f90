@@ -25,9 +25,9 @@ contains
 
   !> Add one poloidal Gaussian point to the original n=0 Poisson block.
   subroutine accumulate_poisson_n0_block(weight,big_r,xjac,factor,bb2,psi_x,psi_y, &
-       filter_perp,filter_hyper,filter_parallel,value,deriv_x,deriv_y,laplace_star,block_n0)
+               filter_hyper,filter_parallel,value,deriv_x,deriv_y,laplace_star,block_n0)
     real*8, intent(in) :: weight,big_r,xjac,factor,bb2,psi_x,psi_y
-    real*8, intent(in) :: filter_perp,filter_hyper,filter_parallel
+    real*8, intent(in) :: filter_hyper,filter_parallel
     real*8, intent(in) :: value(:),deriv_x(:),deriv_y(:),laplace_star(:)
     real*8, intent(inout) :: block_n0(:,:)
     integer :: i,j
@@ -38,7 +38,7 @@ contains
       do i=1,size(value)
         bgrad_i=(deriv_x(i)*psi_y-deriv_y(i)*psi_x)/big_r
         block_n0(i,j)=block_n0(i,j)+weight*xjac*big_r*( &
-             (factor+filter_perp)*(deriv_x(i)*deriv_x(j)+deriv_y(i)*deriv_y(j)) &
+             factor*(deriv_x(i)*deriv_x(j)+deriv_y(i)*deriv_y(j)) &
              +filter_hyper*laplace_star(i)*laplace_star(j) &
              +filter_parallel*bgrad_i*bgrad_j/bb2)
       enddo
@@ -50,10 +50,10 @@ contains
   !! so the complete real operator remains symmetric. The -factor part of
   !! parallel_coefficient is the field-parallel subtraction in grad_perp.
   subroutine accumulate_poisson_nonzero_blocks(weight,big_r,xjac,factor,bb2,f0,psi_x,psi_y, &
-       filter_perp,filter_hyper,filter_parallel,value,deriv_x,deriv_y,laplace_star, &
-       block_a,block_b,block_c)
+               filter_hyper,filter_parallel,value,deriv_x,deriv_y,laplace_star, &
+               block_a,block_b,block_c)
     real*8, intent(in) :: weight,big_r,xjac,factor,bb2,f0,psi_x,psi_y
-    real*8, intent(in) :: filter_perp,filter_hyper,filter_parallel
+    real*8, intent(in) :: filter_hyper,filter_parallel
     real*8, intent(in) :: value(:),deriv_x(:),deriv_y(:),laplace_star(:)
     real*8, intent(inout) :: block_a(:,:),block_b(:,:),block_c(:,:)
     integer :: i,j
@@ -67,7 +67,7 @@ contains
       do i=1,size(value)
         bgrad_i=(deriv_x(i)*psi_y-deriv_y(i)*psi_x)/big_r
         block_a(i,j)=block_a(i,j)+prefactor*( &
-             (factor+filter_perp)*(deriv_x(i)*deriv_x(j)+deriv_y(i)*deriv_y(j)) &
+             factor*(deriv_x(i)*deriv_x(j)+deriv_y(i)*deriv_y(j)) &
              +filter_hyper*laplace_star(i)*laplace_star(j) &
              +parallel_coefficient*bgrad_i*bgrad_j)
         block_b(i,j)=block_b(i,j)+prefactor*( &
