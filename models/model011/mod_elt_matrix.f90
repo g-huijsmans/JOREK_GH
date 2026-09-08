@@ -5,15 +5,17 @@ contains
 
   subroutine element_matrix(element, nodes, xpoint2, xcase2, R_axis, Z_axis, psi_axis, psi_bnd, &
                             R_xpoint, Z_xpoint, ELM, RHS, tid, i_tor_min, i_tor_max, aux_nodes)
-    use constants,                  only: ATOMIC_MASS_UNIT, EL_CHG
-    use mod_parameters,            only: n_vertex_max, n_degrees, var_psi, var_rho
+    use constants,                  only: ATOMIC_MASS_UNIT, EL_CHG, MU_ZERO
+    use mod_parameters,            only: n_vertex_max, n_degrees, var_psi, var_rho, var_T
     use data_structure,            only: type_element, type_node
     use gauss,                     only: n_gauss, wgauss
     use basis_at_gaussian,         only: H, H_s, H_t, H_ss, H_st, H_tt
     use phys_module,               only: F0, central_mass, filter_perp, filter_hyper, filter_par, &
-                                         filter_perp_n0, filter_hyper_n0, filter_par_n0, mode, mode_type
+                                         filter_perp_n0, filter_hyper_n0, filter_par_n0, mode, mode_type, &
+                                         central_density
     use mod_poisson_element_kernel, only: accumulate_poisson_n0_block, &
-                                          accumulate_poisson_nonzero_blocks, scatter_poisson_harmonics
+                                          accumulate_poisson_nonzero_blocks, scatter_poisson_harmonics, &
+                                          accumulate_poisson_mass_block, gk_adiabatic
 
     implicit none
 
@@ -30,7 +32,8 @@ contains
     integer, parameter :: basis_size = n_vertex_max*n_degrees
     integer            :: i, j, ms, mt, a, n_tor_local
     real*8             :: xjac, xjac_x, xjac_y, big_r, bb2, factor, weight
-    real*8             :: psi_g, psi_s, psi_t, psi_x, psi_y, psi_norm, rho, filter_par_centre
+    real*8             :: psi_g, psi_s, psi_t, psi_x, psi_y, psi_norm, rho, temperature
+    real*8             :: filter_par_centre, adiabatic_factor
     real*8             :: x_g, x_s, x_t, x_ss, x_st, x_tt
     real*8             :: y_g, y_s, y_t, y_ss, y_st, y_tt
     real*8             :: value(basis_size), deriv_x(basis_size), deriv_y(basis_size)
@@ -52,7 +55,7 @@ contains
       do mt = 1, n_gauss
         x_g = 0.d0; x_s = 0.d0; x_t = 0.d0; x_ss = 0.d0; x_st = 0.d0; x_tt = 0.d0
         y_g = 0.d0; y_s = 0.d0; y_t = 0.d0; y_ss = 0.d0; y_st = 0.d0; y_tt = 0.d0
-        psi_g = 0.d0; psi_s = 0.d0; psi_t = 0.d0; rho = 0.d0
+        psi_g = 0.d0; psi_s = 0.d0; psi_t = 0.d0; rho = 0.d0; temperature = 0.d0
 
         do i = 1, n_vertex_max
           do j = 1, n_degrees
@@ -81,6 +84,7 @@ contains
             psi_s = psi_s + nodes(i)%values(1,j,var_psi)*deriv_s(a)
             psi_t = psi_t + nodes(i)%values(1,j,var_psi)*deriv_t(a)
             rho   = rho   + nodes(i)%values(1,j,var_rho)*value(a)
+            temperature = temperature + nodes(i)%values(1,j,var_T)*value(a)
           enddo
         enddo
 
@@ -117,6 +121,14 @@ contains
         call accumulate_poisson_nonzero_blocks(weight,big_r,xjac,factor,bb2,F0,psi_x,psi_y, &
              filter_perp,filter_hyper,filter_par,value,deriv_x,deriv_y,laplace_star, &
              block_a,block_b,block_c)
+        if (gk_adiabatic) then
+          if (temperature.le.0.d0) error stop 'Non-positive electron temperature in adiabatic GK Poisson matrix.'
+          ! var_T stores 2*T_e in JOREK pressure units.  With
+          ! Phi=(F0/t_norm)*u, division by e*n_norm*(F0/t_norm) leaves
+          ! e*n_e/(n_norm*T_e) = 2*e*mu0*n_norm*rho/var_T = rho/T_e[eV].
+          adiabatic_factor = 2.d0*EL_CHG*MU_ZERO*(central_density*1.d20)*rho/temperature
+          call accumulate_poisson_mass_block(weight,big_r,xjac,adiabatic_factor,value,block_a)
+        endif
       enddo
     enddo
 

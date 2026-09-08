@@ -205,6 +205,8 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 ei_small_angle_scattering_Lu,                       &
                 filter_perp,    filter_hyper,    filter_par,        &
                 filter_perp_n0, filter_hyper_n0, filter_par_n0,     &
+                filter_gk_hyper, filter_gk_par,                     &
+                filter_gk_hyper_n0, filter_gk_par_n0,               &
                 apply_dirichlet_proj, restart_particles,            &
                 proj_collection_period,                             &
                 part_group_configs, part_groups_in_use, valves,     &

@@ -2,10 +2,26 @@
 module mod_poisson_element_kernel
   implicit none
   private
+  logical, public :: gk_adiabatic = .false.
   public :: accumulate_poisson_n0_block, accumulate_poisson_nonzero_blocks
   public :: scatter_poisson_harmonics
   public :: accumulate_poisson_load_mass, apply_poisson_load_harmonics
+  public :: accumulate_poisson_mass_block
 contains
+
+  !> Add a scalar mass contribution at one poloidal Gaussian point.
+  subroutine accumulate_poisson_mass_block(weight,big_r,xjac,factor,value,block)
+    real*8, intent(in) :: weight,big_r,xjac,factor
+    real*8, intent(in) :: value(:)
+    real*8, intent(inout) :: block(:,:)
+    integer :: i,j
+
+    do j=1,size(value)
+      do i=1,size(value)
+        block(i,j)=block(i,j)+weight*xjac*big_r*factor*value(i)*value(j)
+      enddo
+    enddo
+  end subroutine accumulate_poisson_mass_block
 
   !> Add one poloidal Gaussian point to the original n=0 Poisson block.
   subroutine accumulate_poisson_n0_block(weight,big_r,xjac,factor,bb2,psi_x,psi_y, &

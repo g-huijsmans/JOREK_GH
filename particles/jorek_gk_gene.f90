@@ -28,6 +28,7 @@ use mod_gc_variational
 use nodes_elements
 use mod_poisson_solver, only: poisson_solve_action
 use mod_poisson_rhs, only: assemble_direct_poisson_rhs
+use mod_poisson_element_kernel, only: gk_adiabatic
 use mod_uncoupled_projection, only: assemble_projection_rhs
 use mod_simulation_data, only: type_MHD_SIM
 use mod_sobseq_rng
@@ -40,7 +41,7 @@ use mod_normalisations
 use phys_module, only: F0, tstep, nstep, nout, restart, rho_0, rho_1, rho_coef
 use phys_module, only: CENTRAL_MASS, CENTRAL_DENSITY, xcase, xpoint, index_now, index_start
 use phys_module, only: nstep_particles, nsubstep_particles, tstep_particles, nsubstep_electrons
-use phys_module, only: part_group_configs, n_part_groups
+use phys_module, only: n_part_groups
 use phys_module, only: filter_perp, filter_hyper, filter_par, filter_perp_n0, filter_hyper_n0, filter_par_n0
 use phys_module, only: xtime, energies, mode, restart_particles, n_tht, n_leg
 use phys_module, only: T_scale_factor, B_scale_factor, t_now
@@ -79,7 +80,9 @@ type(type_element_list), target                   :: eq_element_list
 !type(type_bnd_node_list)    :: bnd_node_list !< List of boundary nodes.
 
 logical :: update_electric_potential ! move to input?
-integer :: ion_group, electron_group
+logical :: gk_diagnostics_done
+integer :: ion_group, electron_group, profile_electron_group
+integer :: electron_push_deposition_calls, diagnostic_harmonic
 integer :: n_particles_out
 integer :: n_update_density
 integer :: n_update_temperature
@@ -106,6 +109,8 @@ real*8    :: potential_local_lost_ions, potential_total_lost_ions, potential_loc
 real*8    :: potential_local_ions,      potential_total_ions,      potential_local_electrons,      potential_total_electrons
 integer   :: total_ions_lost, total_electrons_lost, n_zeros
 real*8    :: density_min, density_s, density_t, density_st, mass_ratio, psi_n, tstep_electrons, zero_fraction
+real*8    :: phi_n0_max_local, phi_n0_max, poisson_residual, poisson_relative_residual
+logical   :: poisson_residual_available
 
 character*18 :: fileout, filepart
 real*8, allocatable  :: rhs_nodes(:,:), rhs_nodes_local(:,:)
@@ -116,10 +121,12 @@ integer, allocatable :: patch_list(:)
 real*8, allocatable :: feedback_rhs_ions(:,:,:,:,:)
 
 
-psi_n_start = 0.d0          ! limit domain to psi_start:psi_end (in normalised psi)
-psi_n_end   = 1.5d0 
+psi_n_start = 0.12d0          ! limit domain to psi_start:psi_end (in normalised psi)
+psi_n_end   = 0.66d0 
 
 update_electric_potential = .true.
+gk_diagnostics_done = .false.
+electron_push_deposition_calls = 0
 
 zero_fraction        = 0.d0 ! create some space for new heating and fuelling particles
 
@@ -129,17 +136,12 @@ n_update_profiles    = 999999 !20
 n_update_temperature = 999999 !20  ! must be a multiple of n_update_profiles
 n_update_poisson     = 999999 !500
 
-ion_group      = 1 ! to be derived from namelist input later
-electron_group = 2
+ion_group      = 0
+electron_group = 0
 
 !call sim%initialize(skip_group_config =.true.) 
 call sim%initialize()  
 call tr_meminit(sim%my_id, sim%n_mpi)
-
-if (nsubstep_electrons < 1) then
-  if (sim%my_id == 0) write(*,*) 'ERROR: nsubstep_electrons must be at least one'
-  call MPI_ABORT(MPI_COMM_WORLD, 1, ierr)
-endif
 
 zn_norm  = CENTRAL_DENSITY * 1.d20                              ! (number) density normalisation
 rho_norm = CENTRAL_MASS * ATOMIC_MASS_UNIT * zn_norm            ! rho_SI = rho_norm * rho
@@ -154,13 +156,6 @@ write(*,*) ' part_num_groups : ',n_part_groups
 if (restart_particles) restart = .true.
 if (sim%my_id .eq. 0) write(*,*) 'RESTART = ',restart
 
-n_ions            = part_group_configs(ion_group)%n_particles
-n_electrons       = part_group_configs(electron_group)%n_particles
-n_ions_local      = int(n_ions/sim%n_mpi) 
-n_electrons_local = int(n_electrons/sim%n_mpi )
-
-write(*,'(i3,A,2i9.2e12.4)') sim%my_id,' number of particles : ',n_ions_local, n_electrons_local, n_ions, n_electrons
-
 open(113,file='energies.txt')
 
 if (sim%my_id .eq. 0) call init_live_data()
@@ -170,6 +165,36 @@ if (restart_particles) then
   partreader = event(read_action(filename='restart_particles.h5'))
   call with(sim, partreader)
 endif
+
+! Identify the kinetic species from charge, independently of group ordering or
+! names.  A configured group with no markers does not provide a kinetic response.
+do i=1,size(sim%groups)
+  if (ion_group.eq.0 .and. sim%groups(i)%Z.gt.0 .and. sim%groups(i)%n_particles.gt.0.d0) ion_group=i
+  if (electron_group.eq.0 .and. sim%groups(i)%Z.lt.0 .and. sim%groups(i)%n_particles.gt.0.d0) electron_group=i
+enddo
+if (ion_group.eq.0) error stop 'GK Poisson requires a kinetic ion species.'
+gk_adiabatic = electron_group.eq.0
+profile_electron_group = electron_group
+if (gk_adiabatic) profile_electron_group = ion_group
+
+if (sim%my_id.eq.0) then
+  if (gk_adiabatic) then
+    write(*,'(A)') 'GK Poisson: adiabatic electrons, phi(n=0)=0'
+  else
+    write(*,'(A)') 'GK Poisson: kinetic electrons'
+  endif
+endif
+if (.not.gk_adiabatic .and. nsubstep_electrons.lt.1) then
+  if (sim%my_id == 0) write(*,*) 'ERROR: nsubstep_electrons must be at least one'
+  call MPI_ABORT(MPI_COMM_WORLD, 1, ierr)
+endif
+
+n_ions = sim%groups(ion_group)%n_particles
+n_electrons = 0.d0
+if (.not.gk_adiabatic) n_electrons = sim%groups(electron_group)%n_particles
+n_ions_local = int(n_ions/sim%n_mpi)
+n_electrons_local = int(n_electrons/sim%n_mpi)
+write(*,'(i3,A,2i9.2e12.4)') sim%my_id,' number of particles : ',n_ions_local, n_electrons_local, n_ions, n_electrons
 
 fieldreader = event(read_jorek_fields_interp_linear(basename='restart', i=-1))
 call with(sim, fieldreader)
@@ -215,7 +240,7 @@ psi_end   = psi_axis + (psi_bnd - psi_axis) * psi_n_end
 
 if (sim%my_id .eq. 0) write(*,'(A,6e14.6)') 'PSI_AXIS, PSI_BND : ',psi_axis, psi_bnd, psi_start, psi_end, psi_n_start, psi_n_end
 
-!call grid_reduction(sim%fields%node_list,sim%fields%element_list,psi_n_start,psi_n_end,n_tht)
+call grid_reduction(sim%fields%node_list,sim%fields%element_list,psi_n_start,psi_n_end,n_tht)
 
 !allocate(patch_list(sim%fields%element_list%n_elements))
 !if (xpoint) then
@@ -225,15 +250,10 @@ if (sim%my_id .eq. 0) write(*,'(A,6e14.6)') 'PSI_AXIS, PSI_BND : ',psi_axis, psi
 !endif
 
 if (.not. restart_particles) then
-  sim%groups(ion_group)%Z         = part_group_configs(ion_group)%Z
-  sim%groups(ion_group)%mass      = part_group_configs(ion_group)%mass            ! atomic_weights(-2)  !< atomic mass units, -2 for deuterium
-  sim%groups(ion_group)%n_particles = part_group_configs(ion_group)%n_particles  
-
-  sim%groups(electron_group)%Z    = part_group_configs(electron_group)%Z          
-  sim%groups(electron_group)%mass = part_group_configs(electron_group)%mass       ! atomic_weights(-2)/mass_ratio !< atomic mass units, -1 for electrons (here heavy electrons)
-  sim%groups(electron_group)%n_particles = part_group_configs(electron_group)%n_particles  
-  
- if (sim%my_id .eq. 0) write(*,'(A,2e12.4)') ' ion/electron mass : ',sim%groups(ion_group)%mass, sim%groups(electron_group)%mass
+  if (sim%my_id.eq.0) then
+    write(*,'(A,e12.4)') ' ion mass : ',sim%groups(ion_group)%mass
+    if (.not.gk_adiabatic) write(*,'(A,e12.4)') ' electron mass : ',sim%groups(electron_group)%mass
+  endif
 
 !  allocate(particle_gc_vpar::sim%groups(ion_group)%particles(n_ions_local))
 !  allocate(particle_gc_vpar::sim%groups(electron_group)%particles(n_electrons_local))
@@ -243,34 +263,40 @@ if (.not. restart_particles) then
   call initialise_particles_H_mu_psi(sim%groups(ion_group)%particles, sim%fields, sobseq_rng(), sim%groups(ion_group)%mass, &
 !                                     uniform_space=.true., uniform_space_rej_f=f_ions, &
                                      uniform_space=.true., uniform_space_rej_f=f_density, &
-                                     uniform_space_rej_vars=[-2,1], charge = +1)
+                                     uniform_space_rej_vars=[-2,1], charge = sim%groups(ion_group)%Z)
 !                                     uniform_space_rej_vars=[-2,1], charge = +1, T_particles=T_ions)
   call cpu_time(t1)
   write(*,*) ' cpu time initisalise ions : ', t1-t0
 
-  call initialise_particles_H_mu_psi(sim%groups(electron_group)%particles, sim%fields, sobseq_rng(), sim%groups(electron_group)%mass, &
+  if (.not.gk_adiabatic) then
+    call initialise_particles_H_mu_psi(sim%groups(electron_group)%particles, sim%fields, sobseq_rng(), sim%groups(electron_group)%mass, &
 !                                     uniform_space=.true., uniform_space_rej_f=f_electrons, &
                                      uniform_space=.true., uniform_space_rej_f=f_density, &
-                                     uniform_space_rej_vars=[-2,1], charge = -1)
+                                     uniform_space_rej_vars=[-2,1], charge = sim%groups(electron_group)%Z)
 !                                     uniform_space_rej_vars=[-2,1], charge = -1, T_particles=T_electrons)
-  call cpu_time(t2)
-  write(*,*) ' cpu time initisalise electrons : ', t2-t1
+    call cpu_time(t2)
+    write(*,*) ' cpu time initisalise electrons : ', t2-t1
+  endif
 
   do i=1, size(sim%groups(ion_group)%particles)
     if (sim%groups(ion_group)%particles(i)%x(2) .lt. ES%z_xpoint(1) ) sim%groups(ion_group)%particles(i)%i_elm = 0
   enddo
-  do i=1, size(sim%groups(electron_group)%particles)
-    if (sim%groups(electron_group)%particles(i)%x(2) .lt. ES%z_xpoint(1) ) sim%groups(electron_group)%particles(i)%i_elm = 0
-  enddo
+  if (.not.gk_adiabatic) then
+    do i=1, size(sim%groups(electron_group)%particles)
+      if (sim%groups(electron_group)%particles(i)%x(2) .lt. ES%z_xpoint(1) ) sim%groups(electron_group)%particles(i)%i_elm = 0
+    enddo
+  endif
 
   n_zeros = int(zero_fraction * size(sim%groups(ion_group)%particles)) 
   do i=size(sim%groups(ion_group)%particles) - n_zeros + 1, size(sim%groups(ion_group)%particles) 
     sim%groups(ion_group)%particles(i)%i_elm = 0
   enddo
-  n_zeros = int(zero_fraction * size(sim%groups(electron_group)%particles)) 
-  do i=size(sim%groups(electron_group)%particles) - n_zeros + 1, size(sim%groups(electron_group)%particles) 
-    sim%groups(electron_group)%particles(i)%i_elm = 0
-  enddo
+  if (.not.gk_adiabatic) then
+    n_zeros = int(zero_fraction * size(sim%groups(electron_group)%particles))
+    do i=size(sim%groups(electron_group)%particles) - n_zeros + 1, size(sim%groups(electron_group)%particles)
+      sim%groups(electron_group)%particles(i)%i_elm = 0
+    enddo
+  endif
   
   call density_integral(sim%fields%node_list,sim%fields%element_list,f_density,min(psi_axis,psi_bnd),max(psi_axis,psi_bnd),total_particles,total_volume) 
 
@@ -278,15 +304,17 @@ if (.not. restart_particles) then
   if (sim%my_id .eq. 0) write(*,'(A,8e14.6)') ' total particles, volume : ',total_particles, total_volume
 
   call adjust_particle_weights(sim%groups(ion_group)%particles, total_particles)
-  call adjust_particle_weights(sim%groups(electron_group)%particles, total_particles)
+  if (.not.gk_adiabatic) call adjust_particle_weights(sim%groups(electron_group)%particles, total_particles)
 
   if (sim%my_id .eq. 0) write(*,'(A,3e14.6)') ' Ion particle density was adjusted to      : ', total_particles, sim%groups(ion_group)%particles(1)%weight
-  if (sim%my_id .eq. 0) write(*,'(A,3e14.6)') ' Electron particle density was adjusted to : ', total_particles, sim%groups(electron_group)%particles(1)%weight
+  if (sim%my_id.eq.0 .and. .not.gk_adiabatic) &
+    write(*,'(A,3e14.6)') ' Electron particle density was adjusted to : ', total_particles, sim%groups(electron_group)%particles(1)%weight
 
   call with(sim, counter)        
 
   n_ions_local      = size(sim%groups(ion_group)%particles,1)
-  n_electrons_local = size(sim%groups(electron_group)%particles,1)
+  n_electrons_local = 0
+  if (.not.gk_adiabatic) n_electrons_local = size(sim%groups(electron_group)%particles,1)
   allocate(index_lost_ions(int(zero_fraction*n_ions_local)),     index_lost_electrons(int(zero_fraction*n_electrons_local)))
 
   n_ions_lost      = 0
@@ -298,9 +326,9 @@ endif  ! restart_particles
 project_profiles = new_projection(sim%fields%node_list, sim%fields%element_list, &
                       filter    = filter_perp,    filter_hyper    = filter_hyper,    filter_parallel    = filter_par,    &
                       filter_n0 = filter_perp_n0, filter_hyper_n0 = filter_hyper_n0, filter_parallel_n0 = filter_par_n0, &
-                      f=[proj_f(proj_one,      group = ion_group), proj_f(proj_one,      group = electron_group),        &
-                         proj_f(proj_Pressure, group = ion_group), proj_f(proj_Pressure, group = electron_group),        &
-                         proj_f(proj_vpar,     group = ion_group), proj_f(proj_vpar,     group = electron_group)],       &
+                      f=[proj_f(proj_one,      group = ion_group), proj_f(proj_one,      group = profile_electron_group), &
+                         proj_f(proj_Pressure, group = ion_group), proj_f(proj_Pressure, group = profile_electron_group), &
+                         proj_f(proj_vpar,     group = ion_group), proj_f(proj_vpar,     group = profile_electron_group)],&
 !                      do_dirichlet_open_n0 = .false.,   do_dirichlet_corners_n0 = .false., do_neumann_n0 = .true.,      &
                       do_dirichlet =.false.,                                                                             &
                       fractional_digits = 9, calc_integrals=.false., to_vtk=.true., to_h5=.true., basename='profiles', nsub=5)
@@ -417,11 +445,14 @@ do i=1, nstep_particles
                               
   feedback_rhs_ions = jorek_feedback%rhs               ! the ion contribution to the right hand side
 
-  if (sim%my_id .eq. 0) write(*,*) ' nsubstep_electrons, t_step_electrons : ',nsubstep_electrons
+  if (.not.gk_adiabatic) then
+    if (sim%my_id.eq.0) write(*,*) ' nsubstep_electrons, t_step_electrons : ',nsubstep_electrons
+    tstep_electrons = tstep_particles/nsubstep_electrons
+  else
+    tstep_electrons = tstep_particles
+  endif
 
-  tstep_electrons = tstep_particles / nsubstep_electrons
-
-  do k=1, nsubstep_electrons
+  do k=1,merge(1,nsubstep_electrons,gk_adiabatic)
                             
     reservoir_E_ions      = + reservoir_delta_E      ! use delta_E of ie collisions also for the ei collisions (to ensure conservation)
     reservoir_P_ions      = + reservoir_delta_P
@@ -433,14 +464,17 @@ do i=1, nstep_particles
 
     jorek_feedback%rhs = feedback_rhs_ions !???????????????? WHY THIS
 
-    call loop_particle_gc_local(sim, electron_group, 0,  ion_group, electron_group,           &
-                                jorek_feedback, project_profiles, project_density,            &
-                                tstep_electrons, nsubstep_particles, particle_start_time,     &
-                                index_lost_electrons, n_electrons_lost, n_electrons_lost_max, &
-                                energy_local_electrons,    energy_local_lost_electrons,       &
-                                momentum_local_electrons,  momentum_local_lost_electrons,     &
-                                potential_local_electrons, potential_local_lost_electrons,    &
-                                .true.)   ! electrons
+    if (.not.gk_adiabatic) then
+      electron_push_deposition_calls = electron_push_deposition_calls+1
+      call loop_particle_gc_local(sim, electron_group, 0,  ion_group, electron_group,           &
+                                  jorek_feedback, project_profiles, project_density,            &
+                                  tstep_electrons, nsubstep_particles, particle_start_time,     &
+                                  index_lost_electrons, n_electrons_lost, n_electrons_lost_max, &
+                                  energy_local_electrons,    energy_local_lost_electrons,       &
+                                  momentum_local_electrons,  momentum_local_lost_electrons,     &
+                                  potential_local_electrons, potential_local_lost_electrons,    &
+                                  .true.)   ! electrons
+    endif
 
     reservoir_E_ions = reservoir_E_ions + reservoir_delta_E      ! use delta_E of ie collisions also for the ei collisions (to ensure conservation)
     reservoir_P_ions = reservoir_P_ions + reservoir_delta_P
@@ -457,6 +491,9 @@ do i=1, nstep_particles
 
     if (update_electric_potential) then
 
+      ! The first real-Fourier component is n=0 and is excluded from this
+      ! first adiabatic-electron model.
+      if (gk_adiabatic) jorek_feedback%rhs(:,:,:,1,1) = 0.d0
       call assemble_projection_rhs(sim%fields%node_list,sim%fields%element_list, &
            jorek_feedback%rhs(:,:,:,:,1),deposition_rhs,MPI_COMM_WORLD)
       call assemble_direct_poisson_rhs(deposition_rhs,poisson_rhs)
@@ -483,6 +520,38 @@ do i=1, nstep_particles
     do j=node_end, sim%fields%node_list%n_nodes
         sim%fields%node_list%node(j)%values(:,1:4,var_u) = 0.d0
     enddo
+
+    if (gk_adiabatic .and. update_electric_potential .and. .not.gk_diagnostics_done) then
+      phi_n0_max_local = 0.d0
+      do j=1,sim%fields%node_list%n_nodes
+        phi_n0_max_local = max(phi_n0_max_local, &
+             maxval(abs(sim%fields%node_list%node(j)%values(1,1:4,var_u))))
+      enddo
+      call MPI_AllReduce(phi_n0_max_local,phi_n0_max,1,MPI_DOUBLE_PRECISION,MPI_MAX, &
+                         MPI_COMM_WORLD,ierr)
+      call poisson%residual_norm(diagnostic_harmonic,poisson_residual, &
+                                 poisson_relative_residual,poisson_residual_available)
+      if (sim%my_id.eq.0) then
+        write(*,'(A,ES14.6)') 'GK adiabatic check: max |phi(n=0)| = ',phi_n0_max
+        if (phi_n0_max.gt.1.d-14) &
+          write(*,'(A,ES14.6)') 'WARNING: adiabatic phi(n=0) exceeds tolerance: ',1.d-14
+        if (electron_push_deposition_calls.eq.0) then
+          write(*,'(A)') 'GK adiabatic check: kinetic electron push/deposition disabled'
+        else
+          write(*,'(A,I0)') 'WARNING: kinetic electron push/deposition calls in adiabatic mode: ', &
+                             electron_push_deposition_calls
+        endif
+        if (poisson_residual_available) then
+          write(*,'(A)') 'GK adiabatic Poisson check:'
+          write(*,'(A,I0)') '  harmonic n = ',diagnostic_harmonic
+          write(*,'(A,ES14.6)') '  ||A phi - b||_2 = ',poisson_residual
+          write(*,'(A,ES14.6)') '  ||A phi - b||_2 / ||b||_2 = ',poisson_relative_residual
+        else
+          write(*,'(A)') 'WARNING: assembled Poisson matrix unavailable for residual check'
+        endif
+      endif
+      gk_diagnostics_done = .true.
+    endif
 
   enddo ! substep electrons
 

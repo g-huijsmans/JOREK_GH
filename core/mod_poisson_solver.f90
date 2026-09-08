@@ -28,6 +28,7 @@ module mod_poisson_solver
     procedure :: solve    => solve_poisson_system
     procedure :: gather   => gather_poisson_solution
     procedure :: store_phi => store_poisson_solution
+    procedure :: residual_norm => poisson_residual_norm
     procedure :: finalize => finalize_poisson_solver
     procedure :: do       => do_poisson_solve
   end type poisson_solve_action
@@ -214,6 +215,102 @@ contains
     call gather_solution(this%solver%pc, this%phi_global)
     this%solution_gathered = .true.
   end subroutine gather_poisson_solution
+
+
+  !> Evaluate the residual of the first retained nonzero physical harmonic
+  !! using the assembled mode-family matrix and the RHS supplied to the solve.
+  !! Both real-Fourier components of the selected harmonic are included.
+  subroutine poisson_residual_norm(this, harmonic, absolute_norm, relative_norm, available)
+    use mpi_mod
+    use mod_parameters, only: n_tor
+    use phys_module, only: mode
+
+    class(poisson_solve_action), intent(in) :: this
+    integer, intent(out)                    :: harmonic
+    real*8, intent(out)                     :: absolute_norm, relative_norm
+    logical, intent(out)                    :: available
+
+    real*8, allocatable :: ax(:), solver_x(:)
+    real*8              :: residual_sq_local, residual_sq_global
+    real*8              :: rhs_sq_local, rhs_sq_global, residual
+    integer             :: component, slot, i, ierr, available_local, available_global
+    logical             :: owns_rows, selected_family
+
+    harmonic = 0
+    do component=1,n_tor
+      if (mode(component).ne.0) then
+        harmonic = mode(component)
+        exit
+      endif
+    enddo
+
+    available_local = 0
+    if (this%solution_gathered .and. harmonic.ne.0 .and. &
+        associated(this%solver%pc%mat%irn) .and. &
+        associated(this%solver%pc%mat%jcn) .and. &
+        associated(this%solver%pc%mat%val)) available_local = 1
+    call MPI_AllReduce(available_local,available_global,1,MPI_INTEGER,MPI_MIN, &
+                       this%solver%pc%comm,ierr)
+    available = available_global.eq.1
+    if (.not.available) then
+      absolute_norm = -1.d0
+      relative_norm = -1.d0
+      return
+    endif
+
+    allocate(ax(this%solver%pc%rhs%n),solver_x(this%solver%pc%rhs%n))
+    ax = 0.d0
+    solver_x = this%solver%pc%rhs%val
+    if (this%solver%pc%mat%scaled) then
+      if (.not.associated(this%solver%pc%mat%column_scaling)) then
+        available_local = 0
+      endif
+    endif
+    call MPI_AllReduce(available_local,available_global,1,MPI_INTEGER,MPI_MIN, &
+                       this%solver%pc%comm,ierr)
+    available = available_global.eq.1
+    if (.not.available) then
+      absolute_norm = -1.d0
+      relative_norm = -1.d0
+      deallocate(ax,solver_x)
+      return
+    endif
+    if (this%solver%pc%mat%scaled) then
+      solver_x = solver_x*this%solver%pc%mat%column_scaling
+    endif
+
+    selected_family = any(mode(this%solver%pc%mode_set).eq.harmonic)
+    if (selected_family) then
+      do i=1,this%solver%pc%mat%nnz
+        ax(this%solver%pc%mat%irn(i)) = ax(this%solver%pc%mat%irn(i)) + &
+             this%solver%pc%mat%val(i)*solver_x(this%solver%pc%mat%jcn(i))
+      enddo
+    endif
+
+    ! A distributed matrix contributes its owned rows on every family rank;
+    ! a replicated matrix contributes once, from the family master.
+    owns_rows = this%solver%pc%mat%row_distributed .or. this%solver%pc%my_id_n.eq.0
+    residual_sq_local = 0.d0
+    rhs_sq_local = 0.d0
+    if (selected_family .and. owns_rows) then
+      do i=1,this%solver%pc%rhs%n
+        slot = mod(i-1,this%solver%pc%mode_set_n)+1
+        if (mode(this%solver%pc%mode_set(slot)).ne.harmonic) cycle
+        residual = ax(i)-this%rhs_global%val(this%solver%pc%row_index(i))
+        residual_sq_local = residual_sq_local+residual*residual
+        rhs_sq_local = rhs_sq_local + &
+             this%rhs_global%val(this%solver%pc%row_index(i))**2
+      enddo
+    endif
+
+    call MPI_AllReduce(residual_sq_local,residual_sq_global,1,MPI_DOUBLE_PRECISION,MPI_SUM, &
+                       this%solver%pc%comm,ierr)
+    call MPI_AllReduce(rhs_sq_local,rhs_sq_global,1,MPI_DOUBLE_PRECISION,MPI_SUM, &
+                       this%solver%pc%comm,ierr)
+    absolute_norm = sqrt(residual_sq_global)
+    relative_norm = absolute_norm/max(sqrt(rhs_sq_global),tiny(1.d0))
+    deallocate(ax,solver_x)
+  end subroutine poisson_residual_norm
 
 
   !> Store the gathered equation solution as absolute physical node values.
