@@ -1,0 +1,93 @@
+ ***************************************
+ *  namelist produced by eqdsk2jorek   *
+ ***************************************
+   FROM CHEASE, ALL IN MKSA UNITS     20100715   3
+   magnetic field :    2.090 T
+   current        :    0.640 MA
+ ***************************************
+
+  &in1
+
+  restart = .false.
+  tstep   = 0.01
+  nstep   = 1000
+
+  restart_particles  = .false.
+  nstep_particles    = 400 
+  nsubstep_particles = 1
+  nsubstep_electrons = 1
+  tstep_particles    = 5e-7
+
+  filter_perp     = 0.d0 
+  filter_hyper    = 1.d-10
+  filter_par      = 1.d0
+
+  filter_perp_n0  = 0.d0
+  filter_hyper_n0 = 1.d-10
+  filter_par_n0   = 1.d0
+
+  filter_gk_hyper    = 4d-14
+  filter_gk_par      = 4.d-4
+  filter_gk_hyper_n0 = 4d-14
+  filter_gk_par_n0   = 4.d-4
+
+  ei_small_angle_scattering_Orb5 = .false.
+  ei_small_angle_scattering_Lu   = .false.
+
+  part_group_configs(1)%id   = "ion"
+  part_group_configs(1)%Z    = 1
+  part_group_configs(1)%mass = 2.01410178
+  part_group_configs(1)%type = "particle_gc_vpar"
+
+ ! part_group_configs(2)%id   = "ele"
+ ! part_group_configs(2)%Z    = 1
+ ! part_group_configs(2)%mass = 0.0201410178
+ ! part_group_configs(2)%type = "particle_gc_vpar"
+
+  part_group_configs(1)%n_particles = 5e8
+ ! part_group_configs(2)%n_particles = 1e8
+
+  T_scale_factor = 1.0d4
+  B_scale_factor = 1.d0
+
+  nout = 20
+  nout_projection = 20
+
+  rst_hdf5 = 1
+
+  !_____________________________________boundary definition
+  mf = 0
+
+  ellip  = 1.0d0
+  tria_u = 0.0d0
+  tria_l = 0.0d0
+  quad_u = 0.0d0
+  quad_l = 0.0d0
+
+  R_geo = 1.68
+  Z_geo = 0.
+  F0    = 3.5112
+
+  amin  = 0.590
+
+  !_____________________________________grid parameters
+
+  n_radial = 101
+  n_pol    = 256
+  n_flux   = 101
+  n_tht    = 256
+
+  xr1  = 0.6
+  sig1 = 0.2
+
+  rho_file     = "jorek_density_steady"
+  T_file       = "jorek_temperature_steady"
+!  rho_file     = "/pitagora_work/FUPA2_MHDnoELM/ghuijsma/gene_benchmark/jorek_density_profile_gene_eqdsk_corrected"
+!  T_file       = "/pitagora_work/FUPA2_MHDnoELM/ghuijsma/gene_benchmark/jorek_temperature_profile_gene_eqdsk_corrected"   ! a factor of 10000 smaller than benchmark profile!
+  ffprime_file = "/pitagora_work/FUPA2_MHDnoELM/ghuijsma/gene_benchmark/jorek_ffprime_eqdsk"
+
+  central_density = 0.4939
+  central_mass = 2.00
+
+  &end
+

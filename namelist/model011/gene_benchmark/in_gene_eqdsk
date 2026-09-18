@@ -1,0 +1,52 @@
+ ***************************************
+ *  namelist produced by eqdsk2jorek   *
+ ***************************************
+   FROM CHEASE, ALL IN MKSA UNITS     20100715   3
+   magnetic field :    2.090 T
+   current        :    0.640 MA
+ ***************************************
+ 
+  &in1
+  
+  restart = .f.
+  tstep   = 0.01 
+  nstep   = 0 
+
+  use_mumps_eq =.true.
+  use_pastix_eq = .false.
+  use_strumpack_eq = .false.
+
+  rst_hdf5 = 1 
+ 
+  !_____________________________________boundary definition
+  mf = 0
+
+  ellip  = 1.0d0
+  tria_u = 0.0d0
+  tria_l = 0.0d0
+  quad_u = 0.0d0
+  quad_l = 0.0d0
+
+  R_geo = 1.68     
+  Z_geo = 0.     
+  F0    = 3.5112
+  amin  = 0.590 
+ 
+  !_____________________________________grid parameters
+ 
+  n_radial = 101
+  n_pol    = 256 
+  n_flux   = 101 
+  n_tht    = 256 
+  
+  xr1  = 0.6
+  sig1 = 0.2
+
+  rho_file     = "jorek_density_profile_gene_eqdsk_corrected"
+  T_file       = "jorek_temperature_profile_gene_eqdsk_corrected"   ! a factor of 10000 smaller than benchmark profile!
+  ffprime_file = "jorek_ffprime_eqdsk"
+ 
+  central_density = 0.493963
+  central_mass = 2.00
+
+  &end
