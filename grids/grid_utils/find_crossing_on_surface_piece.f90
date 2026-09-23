@@ -1,11 +1,29 @@
-subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece, R_c,Z_c, &
-                                          R_out,Z_out, r_flux,s_flux, t_tht,ifail, gofast)
+subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece,R_c,Z_c, &
+                                          R_out,Z_out,r_flux,s_flux,t_tht,ifail,gofast)
+  use data_structure
+  implicit none
+  type(type_node_list), intent(in) :: node_list
+  type(type_element_list), intent(in) :: element_list
+  type(type_surface), intent(in) :: surface
+  integer, intent(in) :: piece
+  real*8, intent(inout) :: R_c(4),Z_c(4),R_out,Z_out,r_flux,s_flux,t_tht
+  integer, intent(inout) :: ifail
+  logical, intent(in) :: gofast
+
+  ! Preserve the normal search; physical-distance recovery is explicitly requested.
+  call find_crossing_on_surface_piece_limited(node_list,element_list,surface,piece,R_c,Z_c, &
+                                             R_out,Z_out,r_flux,s_flux,t_tht,ifail,gofast,0.d0)
+end subroutine find_crossing_on_surface_piece
+
+subroutine find_crossing_on_surface_piece_limited(node_list,element_list,surface,piece, R_c,Z_c, &
+                                          R_out,Z_out, r_flux,s_flux, t_tht,ifail, gofast,distance_limit)
   !-------------------------------------------------------------------------
   ! solves two non-linear equations using Newtons method
   ! LU decomposition replaced by explicit solution of 2x2 matrix.
   !
   ! finds the crossing of two coordinate lines given as a series of cubics
   !-------------------------------------------------------------------------
+  use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
   use data_structure
   use mod_interp, only: interp_RZ
   use phys_module, only: R_geo, surface_cross_tol
@@ -23,6 +41,8 @@ subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece, 
   integer,                  intent(inout)       :: ifail
   logical,                  intent(in)          :: gofast
 
+  real*8, intent(in) :: distance_limit ! Positive only for the boundary recovery pass [m].
+
   ! --- Local variables
   integer :: i, ntrial, istart
   integer :: i_elm
@@ -36,6 +56,7 @@ subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece, 
   real*8  :: RR_flux, dRR_flux, RR_tht, dRR_tht,  ZZ_flux, dZZ_flux, ZZ_tht, dZZ_tht
   real*8  :: x(2), FVEC(2), FJAC(2,2), p(2), x_previous(2)
   real*8  :: tolx, tolf, errx, errf, temp, dis, max_step, tol_far
+  real*8  :: recovery_bound(2), endpoint_speed
   real*8  :: RR_mid, ZZ_mid
   real*8  :: RR_mid_surf, ZZ_mid_surf
 
@@ -67,6 +88,16 @@ subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece, 
   dZZg2_dt = dZZg2_dr * drr2 + dZZg2_ds * dss2
   
   ntrial = 20
+  if (distance_limit > 0.d0) then
+    ntrial = 40
+    ! Convert metres to search parameters only for finding a candidate. Acceptance
+    ! below is checked in physical space, including the source-element boundary.
+    endpoint_speed = min(sqrt(dRRg1_dt**2+dZZg1_dt**2),sqrt(dRRg2_dt**2+dZZg2_dt**2))
+    recovery_bound(1) = 1.d0 + distance_limit / max(endpoint_speed,tiny(1.d0))
+    endpoint_speed = min(sqrt(R_c(2)**2+Z_c(2)**2),sqrt(R_c(4)**2+Z_c(4)**2))
+    recovery_bound(2) = 1.d0 + distance_limit / max(endpoint_speed,tiny(1.d0))
+    recovery_bound = max(recovery_bound,1.05d0)
+  endif
   tolx = 1.d-6
   tolf = 1.d-12
 
@@ -85,6 +116,9 @@ subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece, 
     R_out     = 0.5d0*(RR_tht + RR_flux)
     Z_out     = 0.5d0*(ZZ_tht + ZZ_flux)
 
+    if (distance_limit > 0.d0) then
+      if (.not. within_distance_limit()) return
+    endif
     ifail = 0
     return
   endif
@@ -103,6 +137,9 @@ subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece, 
     R_out     = 0.5d0*(RR_tht + RR_flux)
     Z_out     = 0.5d0*(ZZ_tht + ZZ_flux)
 
+    if (distance_limit > 0.d0) then
+      if (.not. within_distance_limit()) return
+    endif
     ifail = 0
     return
   endif
@@ -121,6 +158,9 @@ subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece, 
     R_out     = 0.5d0*(RR_tht + RR_flux)
     Z_out     = 0.5d0*(ZZ_tht + ZZ_flux)
 
+    if (distance_limit > 0.d0) then
+      if (.not. within_distance_limit()) return
+    endif
     ifail = 0
     return
   endif
@@ -139,6 +179,9 @@ subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece, 
     R_out     = 0.5d0*(RR_tht + RR_flux)
     Z_out     = 0.5d0*(ZZ_tht + ZZ_flux)
 
+    if (distance_limit > 0.d0) then
+      if (.not. within_distance_limit()) return
+    endif
     ifail = 0
     return
   endif
@@ -201,6 +244,9 @@ subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece, 
   
         !write(*,'(A,i3,4e16.8)') ' newton (1) : ',i,errf,errx,x
 
+        if (distance_limit > 0.d0) then
+          if (.not. within_distance_limit()) exit
+        endif
         ifail = 0
         return
       endif
@@ -221,15 +267,20 @@ subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece, 
       x = x + p
   
       ! Sometimes you need to look outside the grid...
-      x = max(x,-max_step)
-      x = min(x,+max_step)
-      if(abs(x_previous(1)) .eq. max_step) max_step = max_step + 0.002d0
-      if(abs(x_previous(2)) .eq. max_step) max_step = max_step + 0.002d0
-      x_previous(1) = x(1)
-      x_previous(2) = x(2)
+      if (distance_limit > 0.d0) then
+        x = max(-recovery_bound,min(recovery_bound,x))
+      else
+        x = max(x,-max_step)
+        x = min(x,+max_step)
+        if(abs(x_previous(1)) .eq. max_step) max_step = max_step + 0.002d0
+        if(abs(x_previous(2)) .eq. max_step) max_step = max_step + 0.002d0
+        x_previous(1) = x(1)
+        x_previous(2) = x(2)
+      endif
   
   
-      if (errx .le. tolx) then
+      ! Recovery requires a converged spatial residual, not just a small step.
+      if (errx .le. tolx .and. distance_limit <= 0.d0) then
 
         t_flux = x(1)
         t_tht  = x(2)
@@ -257,5 +308,41 @@ subroutine find_crossing_on_surface_piece(node_list,element_list,surface,piece, 
   
   return
 
-end
+contains
 
+  logical function within_distance_limit()
+    real*8 :: R_end,Z_end,R_source,Z_source,R_clamped,Z_clamped
+    real*8 :: sc,tc
+
+    within_distance_limit = .false.
+    if (.not. all(ieee_is_finite((/R_out,Z_out,r_flux,s_flux,t_tht,t_flux/)))) return
+    if (abs(t_flux) > 1.d0) then
+      if (t_flux < -1.d0) then
+        R_end = RRg1; Z_end = ZZg1
+      else
+        R_end = RRg2; Z_end = ZZg2
+      endif
+      if (sqrt((RR_flux-R_end)**2+(ZZ_flux-Z_end)**2) > distance_limit) return
+    endif
+    if (abs(t_tht) > 1.d0) then
+      if (t_tht < -1.d0) then
+        R_end = R_c(1); Z_end = Z_c(1)
+      else
+        R_end = R_c(3); Z_end = Z_c(3)
+      endif
+      if (sqrt((RR_tht-R_end)**2+(ZZ_tht-Z_end)**2) > distance_limit) return
+    endif
+
+    ! Flux/polar cubics approximate the element mapping. Check the actual source
+    ! position too, and the point available for sampling inside the element.
+    call interp_RZ(node_list,element_list,i_elm,r_flux,s_flux,R_source,Z_source)
+    sc = max(0.d0,min(1.d0,r_flux))
+    tc = max(0.d0,min(1.d0,s_flux))
+    call interp_RZ(node_list,element_list,i_elm,sc,tc,R_clamped,Z_clamped)
+    if (.not. all(ieee_is_finite((/R_source,Z_source,R_clamped,Z_clamped/)))) return
+    if (sqrt((R_source-R_out)**2+(Z_source-Z_out)**2) > distance_limit) return
+    if (sqrt((R_clamped-R_out)**2+(Z_clamped-Z_out)**2) > distance_limit) return
+    within_distance_limit = .true.
+  end function within_distance_limit
+
+end subroutine find_crossing_on_surface_piece_limited

@@ -66,8 +66,9 @@ integer             :: i_elm2, i_vertex2, i_node2
 integer             :: node_indices( (n_order+1)/2, (n_order+1)/2 ), ii, jj
 integer, allocatable :: source_ij(:,:)
 integer             :: failed_lookups, rounded_lookups, lookup_status
+integer             :: failed_crossings, recovered_crossings
 real*8              :: source_s, source_t, source_R, source_Z, rounded_distance
-real*8, parameter   :: boundary_clamp_distance = 50.d-6 ! Maximum sampling displacement [m].
+real*8, parameter   :: boundary_clamp_distance = 50.d-6 ! Maximum crossing recovery / sampling displacement [m].
 real*8              :: boundary_theta, boundary_radius
 
 xpoint = .true.
@@ -682,6 +683,8 @@ enddo
 call tr_allocate(k_cross,1,n_flux_2+n_open_2+n_private_2+1,1,n_tht_2+2*n_leg_2,"k_cross",CAT_GRID)
 
 k_cross = 0
+failed_crossings = 0
+recovered_crossings = 0
 
 k_cross(1,:) = 1
 
@@ -710,7 +713,7 @@ do i=1,n_flux_2+n_open_2
 
     enddo
 
-    if (ifail .ne. 0) write(*,*) ' WARNING (1) node not found (1) : ',ifail,i,j
+    if (ifail /= 0) call recover_crossing(i,j)
 
   enddo
 
@@ -740,11 +743,14 @@ do i=n_flux_2,n_flux_2+n_open_2+n_private_2
 
      enddo
 
-     if (ifail .ne. 0) write(*,*) ' WARNING node not found (2) : ',ifail,i,j
+     if (ifail /= 0) call recover_crossing(i,j)
 
   enddo
 
 enddo
+
+write(*,'(A,2I8)') 'XPOINT crossing summary: recovered,unhandled: ',recovered_crossings,failed_crossings
+if (failed_crossings > 0) error stop 'X-point grid contains unresolved crossings; node construction aborted'
 
 !***********************************************************************
 !*     define the new nodes and finite elements    (nodes first)       *
@@ -1520,7 +1526,7 @@ do i=1,newnode_list%n_nodes
           write(*,'(A,2ES24.15)') 'XPOINT Fourier radius,requested minus Fourier radius [m]: ', &
             boundary_radius,sqrt((R1-boundary_Rgeo)**2+(Z1-boundary_Zgeo)**2)-boundary_radius
           ! Sample equilibrium at the clamped point. Do not move an already built grid.
-          if (rounded_distance < boundary_clamp_distance) then
+          if (rounded_distance <= boundary_clamp_distance) then
             ifail = 0
             rounded_lookups = rounded_lookups + 1
           endif
@@ -1637,4 +1643,42 @@ call tr_deallocate(k_cross,"k_cross",CAT_GRID)
 
 call update_neighbours(node_list,element_list, force_rtree_initialize=.true.)
 return
+
+contains
+
+subroutine recover_crossing(i_surface,j_line)
+  integer, intent(in) :: i_surface,j_line
+  integer :: piece,status,source_element
+  real*8 :: rc(4),zc(4),r,z,s,t,theta
+
+  ! Retry only after every polar piece failed the normal search. This avoids
+  ! selecting an extrapolated crossing ahead of an ordinary valid crossing.
+  do piece=1,n_pieces
+    rc = (/R_polar(piece,1,j_line),1.5d0*(R_polar(piece,2,j_line)-R_polar(piece,1,j_line)), &
+           R_polar(piece,4,j_line),1.5d0*(R_polar(piece,4,j_line)-R_polar(piece,3,j_line))/)
+    zc = (/Z_polar(piece,1,j_line),1.5d0*(Z_polar(piece,2,j_line)-Z_polar(piece,1,j_line)), &
+           Z_polar(piece,4,j_line),1.5d0*(Z_polar(piece,4,j_line)-Z_polar(piece,3,j_line))/)
+    call find_crossing_near_boundary(node_list,element_list,flux_list,i_surface,rc,zc, &
+      r,z,source_element,s,t,theta,status,boundary_clamp_distance)
+    if (status /= 0) cycle
+    if (source_element < 1 .or. source_element > element_list%n_elements) cycle
+    RR_new(i_surface+1,j_line) = r
+    ZZ_new(i_surface+1,j_line) = z
+    ielm_flux(i_surface+1,j_line) = source_element
+    s_flux(i_surface+1,j_line) = s
+    t_flux(i_surface+1,j_line) = t
+    t_tht(i_surface+1,j_line) = theta
+    k_cross(i_surface+1,j_line) = piece
+    recovered_crossings = recovered_crossings + 1
+    write(*,'(A,3I8,3ES24.15)') 'XPOINT crossing recovered: surface,line,element,R,Z,limit [m]: ', &
+      i_surface,j_line,source_element,r,z,boundary_clamp_distance
+    return
+  enddo
+
+  ielm_flux(i_surface+1,j_line) = 0
+  failed_crossings = failed_crossings + 1
+  write(*,'(A,2I8,ES24.15)') 'XPOINT unresolved crossing: surface,line,limit [m]: ', &
+    i_surface,j_line,boundary_clamp_distance
+end subroutine recover_crossing
+
 end subroutine grid_xpoint
