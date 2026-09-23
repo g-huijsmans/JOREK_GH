@@ -978,23 +978,8 @@ subroutine initialise_particles_H_mu_psi(particles, fields, rng_base, mass, T_ma
 
         ! 4. Output to particles (dependent on type of particle)
         chi = TWOPI*ran(6)
-        select type(p1 => particles_tmp(i))
-          type is (particle_kinetic_leapfrog)
-
-! the generic copy of particle_kinetic_leapfrog, i.e p = ..., seems broken, therefor using the non-generic copy
-!          call copy_particle_kinetic_leapfrog( &
-!                 kinetic_to_kinetic_leapfrog(gc_to_kinetic(fields%node_list, fields%element_list, particle, chi, B, mass), &
-!                                             [0.d0, 0.d0, 0.d0], B, mass, dt=0.d0), &
-!                                             p )
-            particles_tmp(i) = gc_to_kinetic_leapfrog(particle, fields%node_list, fields%element_list, chi, [0.d0,0.d0,0.d0], B, mass, dt=0.d0)
-
-            ! if the kinetic position is not in the grid particles(i)%i_elm the particle is lost
-            if (particles_tmp(i)%i_elm .le. 0) found(i) = .false.
-          type is (particle_gc)
-            particles_tmp(i) = particle
-          type is (particle_gc_vpar)
-            call convert_gc_to_gc_vpar(particle, norm2(B), mass, p1)
-        end select
+        call store_initialised_particle(particle, fields, chi, B, mass, particles_tmp(i))
+        if (particles_tmp(i)%i_elm.le.0) found(i)=.false.
       else
         found(i) = .false.
       end if
@@ -1041,6 +1026,26 @@ subroutine initialise_particles_H_mu_psi(particles, fields, rng_base, mass, T_ma
 
   end do
 end subroutine initialise_particles_H_mu_psi
+
+!> Keep polymorphic conversion out of the OpenMP region: Intel compilers
+!> can create invalid descriptors for SELECT TYPE on an array element there.
+subroutine store_initialised_particle(particle, fields, chi, B, mass, output)
+  use mod_fields, only: fields_base
+  use mod_boris, only: gc_to_kinetic_leapfrog
+  use mod_gc_variational, only: convert_gc_to_gc_vpar
+  type(particle_gc), intent(in) :: particle
+  class(fields_base), intent(in) :: fields
+  real*8, intent(in) :: chi, B(3), mass
+  class(particle_base), intent(inout) :: output
+  select type(output)
+  type is(particle_kinetic_leapfrog)
+    output=gc_to_kinetic_leapfrog(particle,fields%node_list,fields%element_list,chi,[0d0,0d0,0d0],B,mass,dt=0d0)
+  type is(particle_gc)
+    output=particle
+  type is(particle_gc_vpar)
+    call convert_gc_to_gc_vpar(particle,norm2(B),mass,output)
+  end select
+end subroutine store_initialised_particle
 
 !> Subroutine for initialising particles in  mu, (psi, theta|R, Z), phi, gamma (gyrophase) space.
 !! Optionally either only at a uniformly distributed n_phi_planes_in set of planes or with

@@ -95,7 +95,7 @@ real*4, external :: f_ions, f_electrons, f_density
 real*8, external :: T_ions, T_electrons
 integer   :: ifail, node_start, node_end
 integer   :: i, j, k, l, m, in, jn, inode, i_elm, index_rhs, i_diagno(6)
-integer   :: seed, i_rng, n_stream, ierr, n_particle_out, i_tor, i_tor_start
+integer   :: seed, i_rng, n_stream, ierr, i_tor, i_tor_start
 integer   :: n_ions_lost, n_electrons_lost, n_ions_lost_max, n_electrons_lost_max
 integer, allocatable :: index_lost_ions(:), index_lost_electrons(:)
 real*8    :: energy_local_lost_ions, energy_total_lost_ions, energy_local_lost_electrons, energy_total_lost_electrons, sum_energy
@@ -607,18 +607,18 @@ do i=1, nstep_particles
       write(fileout,'(A8,i5.5)') 'profiles',index_now  
       call export_restart(project_profiles%node_list, project_profiles%element_list, fileout)
     endif      
-    if (sim%my_id .eq. 0) then
-      write(fileout,'(A7,i5.5)') 'density',index_now  
-      call export_restart(project_density%node_list, project_density%element_list, fileout)
-    endif      
+!    if (sim%my_id .eq. 0) then
+!      write(fileout,'(A7,i5.5)') 'density',index_now  
+!      call export_restart(project_density%node_list, project_density%element_list, fileout)
+!    endif      
     if (sim%my_id .eq.0) then
       write(fileout,'(A5,i5.5)') 'jorek',index_now
       call export_restart(sim%fields%node_list, sim%fields%element_list, fileout)
     endif
   endif
 
-  if (n_particle_out .gt. 0) then
-    if (mod(index_now,n_particle_out) == 0) then
+  if (n_particles_out .gt. 0) then
+    if (mod(index_now,n_particles_out) == 0) then
       write(filepart,'(A4,i5.5,A3)') 'part',index_now,'.h5'
       partwriter = event(write_action(filename=filepart))
       call with(sim, partwriter)

@@ -137,7 +137,11 @@ use_hdf5_access_properties,collective_mpio_in,mpi_comm_in,mpi_info_in)
     !> particle list size for all groups firstly
     n_groups = size(sim%groups,1); allocate(n_particles_loc(n_groups)); n_particles_loc=0;
     do ii=1,n_groups
-      n_particles_loc(ii) = size(sim%groups(ii)%particles,1)
+      if (allocated(sim%groups(ii)%particles)) then
+        n_particles_loc(ii) = size(sim%groups(ii)%particles,1)
+      else
+        n_particles_loc(ii) = 0
+      endif
     enddo
     allocate(n_particles_glob(sim%n_mpi*n_groups,1)); n_particles_glob=0;
     call MPI_Allgather(n_particles_loc,n_groups,MPI_INTEGER,n_particles_glob(:,1),n_groups,&

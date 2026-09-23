@@ -638,14 +638,14 @@ Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr,particle_type_str)
   
   !> compute total number of particles
   n_particles = size(particle_list,1)
-  allocate(x_arr(size(particle_list(1)%x,1)  ,n_particles))
-  allocate(st_arr(size(particle_list(1)%st,1),n_particles))
+  allocate(x_arr(3,n_particles))
+  allocate(st_arr(2,n_particles))
   allocate(weight_arr(n_particles)); allocate(i_elm_arr(n_particles));
   allocate(i_life_arr(n_particles)); allocate(t_birth_arr(n_particles));
-  select type(p=>particle_list(1))
+  select type(p=>particle_list)
   type is (particle_fieldline)
     allocate(v_1d_arr(n_particles))
-    allocate(B_hat_prev_arr(size(p%B_hat_prev,1),n_particles))
+    allocate(B_hat_prev_arr(3,n_particles))
     allocate(character(len=18)::particle_type_str); particle_type_str="particle_fieldline";
   type is (particle_gc)
     allocate(E_arr(n_particles)); allocate(mu_arr(n_particles));
@@ -659,29 +659,29 @@ Bn_k_arr,dBn_k_arr,Bnorm_k_arr,E_k_arr,dAstar_k_arr,particle_type_str)
   type is (particle_gc_Qin)
     allocate(vpar_arr(n_particles)); allocate(mu_arr(n_particles));
     allocate(B_norm_arr(n_particles)); allocate(q_arr(n_particles));
-    allocate(x_m_arr(size(p%x_m,1),n_particles)); allocate(vpar_m_arr(n_particles));
-    allocate(Astar_m_arr(size(p%Astar_m,1),n_particles));
-    allocate(Astar_k_arr(size(p%Astar_k,1),n_particles));
-    allocate(dAstar_k_arr(size(p%dAstar_k,1),size(p%dAstar_k,2),n_particles));
-    allocate(Bn_k_arr(n_particles)); allocate(dBn_k_arr(size(p%dBn_k,1),n_particles));
-    allocate(Bnorm_k_arr(size(p%Bnorm_k,1),n_particles));
-    allocate(E_k_arr(size(p%E_k,1),n_particles));    
+    allocate(x_m_arr(3,n_particles)); allocate(vpar_m_arr(n_particles));
+    allocate(Astar_m_arr(3,n_particles));
+    allocate(Astar_k_arr(3,n_particles));
+    allocate(dAstar_k_arr(3,3,n_particles));
+    allocate(Bn_k_arr(n_particles)); allocate(dBn_k_arr(3,n_particles));
+    allocate(Bnorm_k_arr(3,n_particles));
+    allocate(E_k_arr(3,n_particles));
     allocate(character(len=15)::particle_type_str);
     particle_type_str = "particle_gc_Qin";
   type is (particle_kinetic)
-    allocate(v_2d_arr(size(p%v,1),n_particles)); allocate(q_arr(n_particles));
+    allocate(v_2d_arr(3,n_particles)); allocate(q_arr(n_particles));
     allocate(character(len=16)::particle_type_str);
     particle_type_str = "particle_kinetic";
   type is (particle_kinetic_leapfrog)
-    allocate(v_2d_arr(size(p%v,1),n_particles)); allocate(q_arr(n_particles));
+    allocate(v_2d_arr(3,n_particles)); allocate(q_arr(n_particles));
     allocate(character(len=25)::particle_type_str);
     particle_type_str = "particle_kinetic_leapfrog";
   type is (particle_kinetic_relativistic)
-    allocate(v_2d_arr(size(p%p,1),n_particles)); allocate(q_arr(n_particles));
+    allocate(v_2d_arr(3,n_particles)); allocate(q_arr(n_particles));
     allocate(character(len=29)::particle_type_str);
     particle_type_str = "particle_kinetic_relativistic";
   type is (particle_gc_relativistic)
-    allocate(v_2d_arr(size(p%p,1),n_particles)); allocate(q_arr(n_particles));
+    allocate(v_2d_arr(2,n_particles)); allocate(q_arr(n_particles));
     allocate(character(len=23)::particle_type_str);
     particle_type_str = "particle_gc_relativistic";
   end select

@@ -182,9 +182,9 @@ if (newton_iter_number .gt. find_RZ_nearby_iter) then
     ifail=3
   else
     !$omp critical
-      write(*,"(A,2f10.5,A)") "ERROR: issue in mod_find_rz_nearby; could not find ",R_old,Z_old
-      write(*,"(A)") "This position is likely outside of the domain but find_RZ_nearby_iter (namelist input parameter) is not big"
-      write(*,"(A)") "enough to find the domain boundary element closest to it. Consider using a larger find_RZ_nearby_iter."
+!      write(*,"(A,2f10.5,A)") "ERROR: issue in mod_find_rz_nearby; could not find ",R_old,Z_old
+!      write(*,"(A)") "This position is likely outside of the domain but find_RZ_nearby_iter (namelist input parameter) is not big"
+!      write(*,"(A)") "enough to find the domain boundary element closest to it. Consider using a larger find_RZ_nearby_iter."
     !$omp end critical
   endif
   return
