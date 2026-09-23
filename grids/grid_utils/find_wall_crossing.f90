@@ -1,4 +1,14 @@
 subroutine find_wall_crossing(R_wall,Z_wall,n_wall,Rp,Zp,tht_p,Rw,Zw,Tw)
+  implicit none
+  real*8 :: R_wall(*), Z_wall(*), Rp, Zp, tht_p, Rw, Zw, Tw
+  integer :: n_wall, ifail
+
+  ! Preserve the unrestricted search for existing callers (including divertor legs).
+  call find_wall_crossing_filtered(R_wall,Z_wall,n_wall,Rp,Zp,tht_p,Rw,Zw,Tw, &
+                                  (/0.d0,0.d0/),(/0.d0,0.d0/),ifail)
+end subroutine find_wall_crossing
+
+subroutine find_wall_crossing_filtered(R_wall,Z_wall,n_wall,Rp,Zp,tht_p,Rw,Zw,Tw,origin,normal,ifail)
   !-----------------------------------------------------------------------
   ! subroutine to find the crossing of the line given by (Rp,Zp,tht_p)
   ! with one of the wall segments (given by straight lines, R_wall,Z_wall)
@@ -13,6 +23,8 @@ subroutine find_wall_crossing(R_wall,Z_wall,n_wall,Rp,Zp,tht_p,Rw,Zw,Tw)
   real*8               :: Rp,        Zp,       tht_p
   real*8,  intent(out) :: Rw,        Zw,       Tw
   integer, intent(in)  :: n_wall
+  real*8, intent(in) :: origin(2), normal(2) ! Unit normal pointing into the allowed half-plane; zero disables filtering.
+  integer, intent(out) :: ifail
   
   ! --- local variables
   real*8  :: tan_p, tan12, PI, TWOPI, HALFPI, area
@@ -32,6 +44,7 @@ subroutine find_wall_crossing(R_wall,Z_wall,n_wall,Rp,Zp,tht_p,Rw,Zw,Tw)
   if (tht_p .gt. 1.5*PI)  tht_p = tht_p - TWOPI
   
   found = .false.
+  ifail = 1
 
 !---- determine if wall points are clockwise or anti-clockwise
   area = 0.d0           ! assumes a closed curve (first point equals last point)
@@ -91,12 +104,19 @@ subroutine find_wall_crossing(R_wall,Z_wall,n_wall,Rp,Zp,tht_p,Rw,Zw,Tw)
       endif
     endif
   
-    if (found) exit
+    if (found) then
+      ! Continue searching when the candidate is on the wrong side of the dividing line.
+      if ((Rw-origin(1))*normal(1) + (Zw-origin(2))*normal(2) < -1.d-10) then
+        found = .false.
+        cycle
+      endif
+      ifail = 0
+      exit
+    endif
   
   enddo
   
 !  if (.not. found) write(*,'(A,6f16.8)') ' CROSSING NOT FOUND : ',Rp,Zp,tht_p,Rw,Zw,Tw
   
   return
-end subroutine find_wall_crossing
-
+end subroutine find_wall_crossing_filtered

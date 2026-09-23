@@ -11,6 +11,7 @@ use data_structure
 use mod_neighbours, only: update_neighbours
 use mod_interp
 use phys_module, only: force_central_node, write_ps, fix_axis_nodes, treat_axis
+use phys_module, only: boundary_mf => mf, boundary_fbnd => fbnd, boundary_Rgeo => R_geo, boundary_Zgeo => Z_geo
 use mod_grid_conversions
 use mod_poiss
 use mod_node_indices
@@ -63,6 +64,11 @@ character*4         :: label
 integer             :: i_elm1, i_vertex1, i_node1, i_node_save
 integer             :: i_elm2, i_vertex2, i_node2
 integer             :: node_indices( (n_order+1)/2, (n_order+1)/2 ), ii, jj
+integer, allocatable :: source_ij(:,:)
+integer             :: failed_lookups, rounded_lookups, lookup_status
+real*8              :: source_s, source_t, source_R, source_Z, rounded_distance
+real*8, parameter   :: boundary_clamp_distance = 50.d-6 ! Maximum sampling displacement [m].
+real*8              :: boundary_theta, boundary_radius
 
 xpoint = .true.
 my_id  = 0
@@ -140,6 +146,8 @@ call tr_allocate(ielm_flux,1,n_psi_2,1,n_tht_3,"ielm_flux",CAT_GRID)
 call tr_allocate(s_flux,1,n_psi_2,1,n_tht_3,"s_flux",CAT_GRID)
 call tr_allocate(t_flux,1,n_psi_2,1,n_tht_3,"t_flux",CAT_GRID)
 call tr_allocate(t_tht,1,n_psi_2,1,n_tht_3,"t_tht",CAT_GRID)
+allocate(source_ij(2,n_nodes_max))
+source_ij = 0
 
 !------------------------------------- find some points on the legs
 RL1 = 999.; ZL1 = 1.d10        ! left  bottom point of inner leg (i.e on last flux_surface)
@@ -807,6 +815,7 @@ do i=1,n_flux-1                 !------------------------ the closed field lines
     node  = (n_tht-1)*(i-1) + j
     index = node
 
+    source_ij(:,index) = (/ i2,j2 /)
     newnode_list%node(index)%x(1,1,:) = (/ RR_new(i2,j2), ZZ_new(i2,j2) /)
     newnode_list%node(index)%x(1,2,:) = (/ dR_dt, dZ_dt /) / sqrt(dR_dt**2 + dZ_dt**2)
     newnode_list%node(index)%boundary = 0
@@ -923,6 +932,7 @@ do i=n_flux,n_flux+n_open           !--------------------------- nodes on the op
 
     index = index + 1
 
+    source_ij(:,index) = (/ i2,j2 /)
     newnode_list%node(index)%x(1,1,:) = (/ RR_new(i2,j2), ZZ_new(i2,j2) /)
     newnode_list%node(index)%x(1,2,:) = (/ dR_dt, dZ_dt /)   / sqrt(dR_dt**2 + dZ_dt**2)
     newnode_list%node(index)%x(1,3,:) = (/ -PSI_Z, +PSI_R /) / sqrt(PSI_R**2 + PSI_Z**2)
@@ -977,6 +987,7 @@ do j=1, n_leg                         !--------------------------- nodes on righ
 
       index = index + 1
 
+      source_ij(:,index) = (/ i2,j2 /)
       newnode_list%node(index)%x(1,1,:) = (/ RR_new(i2,j2), ZZ_new(i2,j2) /)
       newnode_list%node(index)%x(1,2,:) = (/ dR_dt, dZ_dt /)   / sqrt(dR_dt**2 + dZ_dt**2)
       newnode_list%node(index)%x(1,3,:) = (/ -PSI_Z, +PSI_R /) / sqrt(PSI_R**2 + PSI_Z**2)
@@ -1029,6 +1040,7 @@ do l=1, n_leg-1                       !--------------------------- nodes on left
 
     index = index + 1
 
+    source_ij(:,index) = (/ i2,j2 /)
     newnode_list%node(index)%x(1,1,:) = (/ RR_new(i2,j2), ZZ_new(i2,j2) /)
     newnode_list%node(index)%x(1,2,:) = (/ dR_dt, dZ_dt /)   / sqrt(dR_dt**2 + dZ_dt**2)
     newnode_list%node(index)%x(1,3,:) = (/ -PSI_Z, +PSI_R /) / sqrt(PSI_R**2 + PSI_Z**2)
@@ -1466,12 +1478,61 @@ if (fix_axis_nodes) then
   if (n_order .ge. 5) call set_high_order_sizes_on_axis(newnode_list,newelement_list)
 endif
 
+failed_lookups = 0
+rounded_lookups = 0
 do i=1,newnode_list%n_nodes
 
   R1 = newnode_list%node(i)%x(1,1,1)
   Z1 = newnode_list%node(i)%x(1,1,2)
 
   call find_RZ(node_list,element_list,R1,Z1,R_out,Z_out,ielm_out,s_out,t_out,ifail)
+
+  if (ifail /= 0 .or. ielm_out < 1 .or. ielm_out > element_list%n_elements) then
+    lookup_status = ifail
+    ifail = 999
+    ! Recover the generating crossing, not the stale outputs of a failed find_RZ.
+    i2 = source_ij(1,i)
+    j2 = source_ij(2,i)
+    if (i2 > 0 .and. j2 > 0) then
+      ielm_out = ielm_flux(i2,j2)
+      source_s = s_flux(i2,j2)
+      source_t = t_flux(i2,j2)
+      write(*,'(A,3I8,4ES24.15)') 'XPOINT lookup failed: node,status,source element,R,Z,s,t: ', &
+        i,lookup_status,ielm_out,R1,Z1,source_s,source_t
+      if (ielm_out >= 1 .and. ielm_out <= element_list%n_elements) then
+        ! Accept outer-s overshoots only within the physical distance tolerance.
+        if (source_s > 1.d0 .and. source_t >= 0.d0 .and. source_t <= 1.d0) then
+          call interp_RZ(node_list,element_list,ielm_out,source_s,source_t,source_R,source_Z)
+          s_out = 1.d0
+          t_out = source_t
+          call interp_RZ(node_list,element_list,ielm_out,s_out,t_out,R_out,Z_out)
+          rounded_distance = sqrt((R_out-R1)**2 + (Z_out-Z1)**2)
+          write(*,'(A,2ES24.15)') 'XPOINT source interpolation minus requested R,Z: ',source_R-R1,source_Z-Z1
+          write(*,'(A,2ES24.15)') 'XPOINT rounded R,Z: ',R_out,Z_out
+          write(*,'(A,3ES24.15)') 'XPOINT rounded minus requested dR,dZ,distance [m]: ', &
+            R_out-R1,Z_out-Z1,rounded_distance
+          boundary_theta = atan2(Z1-boundary_Zgeo,R1-boundary_Rgeo)
+          boundary_radius = boundary_fbnd(1)/2.d0
+          do m=2,boundary_mf/2
+            boundary_radius = boundary_radius + boundary_fbnd(2*m-1)*cos((m-1)*boundary_theta) &
+                                              + boundary_fbnd(2*m)*sin((m-1)*boundary_theta)
+          enddo
+          write(*,'(A,2ES24.15)') 'XPOINT Fourier radius,requested minus Fourier radius [m]: ', &
+            boundary_radius,sqrt((R1-boundary_Rgeo)**2+(Z1-boundary_Zgeo)**2)-boundary_radius
+          ! Sample equilibrium at the clamped point. Do not move an already built grid.
+          if (rounded_distance < boundary_clamp_distance) then
+            ifail = 0
+            rounded_lookups = rounded_lookups + 1
+          endif
+        endif
+      endif
+    endif
+    if (ifail /= 0 .or. ielm_out < 1 .or. ielm_out > element_list%n_elements) then
+      write(*,'(A,I8,2ES24.15)') 'XPOINT unhandled lookup: node,R,Z: ',i,R1,Z1
+      failed_lookups = failed_lookups + 1
+      cycle
+    endif
+  endif
 
   call interp_RZ(node_list,element_list,ielm_out,s_out,t_out,   &
                  RRg1,dRRg1_dr,dRRg1_ds,ZZg1,dZZg1_dr,dZZg1_ds)
@@ -1490,6 +1551,9 @@ do i=1,newnode_list%n_nodes
   if (newnode_list%node(i)%boundary .eq. 2) newnode_list%node(i)%values(1,3,1) = 0.d0
 
 enddo
+
+write(*,'(A,2I8)') 'XPOINT lookup summary: rounded,unhandled: ',rounded_lookups,failed_lookups
+if (failed_lookups > 0) error stop 'X-point grid contains nodes that cannot be interpolated'
 
 ! --- Use Poisson to project psi variable from old grid onto new grid
 ! --- At high order, this is the best way to do it.

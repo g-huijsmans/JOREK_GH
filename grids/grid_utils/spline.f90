@@ -57,6 +57,7 @@
 !
 !     AUFSTELLEN DES GLEICHUNGSSYSTEMS
 !
+      !DIR$ NOVECTOR
       DO 20 I = 1, N-2
          A(I) = 3.d0 * ((Y(I+2)-Y(I+1)) / H(I+1) - (Y(I+1)-Y(I)) / H(I))
          B(I) = H(I)

@@ -607,6 +607,10 @@ module phys_module
   integer :: n_up_leg          !< Number of 'poloidal' grid points along the divertor legs at the top (upper Xpoint or double-null)
   integer :: n_up_leg_out      !< Number of 'poloidal' grid points along the divertor legs on the top on the LFS (upper Xpoint or double-null)
   integer :: n_ext             !< Number of 'radial' grid points from the outermost flux surface to wall)
+  logical :: wall_transition_partition = .true. !< Partition lower-wall extension at detected bends.
+  real*8 :: wall_transition_R(2) = -1.d0 !< Left/right overrides [m]; negative R selects automatic detection.
+  real*8 :: wall_transition_Z(2) = 0.d0
+  real*8 :: wall_transition_window = 0.02d0 !< One-sided physical window for wall turning estimate [m].
   logical :: n_tht_equidistant !< switch on to get an equidistant poloidal distribution of elements in the core of the grid (psi<0.5)
   real*8  :: xr_closed(3)      !< Location for grid accumulation (for flux-aligned grid)
   real*8  :: SIG_closed(3)     !< Width with grid accumulation (for flux-aligned grid)

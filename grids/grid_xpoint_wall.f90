@@ -12,8 +12,10 @@ use tr_module
 use gauss
 use basis_at_gaussian
 use phys_module, only:   n_limiter, R_limiter, Z_limiter, write_ps, fix_axis_nodes, force_central_node, treat_axis, wall_file
+use phys_module, only: wall_transition_partition, wall_transition_R, wall_transition_Z, wall_transition_window
 use mod_neighbours, only: update_neighbours
 use mod_interp
+use mod_basisfunctions, only: basisfunctions
 use mod_grid_conversions
 use mod_poiss
 use mod_node_indices
@@ -70,6 +72,9 @@ real*8              :: x_g(n_gauss,n_gauss), y_g(n_gauss,n_gauss), psi_g(n_gauss
 real*8              :: abltg(3), t_node, sign_psi
 real*8              :: Rtmp, Ztmp, dRtmp, dZtmp, Rtmp2, Ztmp2, dRtmp2, dZtmp2, Rtmp3, Ztmp3, dRtmp3, dZtmp3
 real*8              :: t2, t3, t_delta, t_total, xl_axis, theta_axis
+real*8              :: wall_origin(2), wall_normal(2)
+real*8, allocatable :: wall_arc(:)
+real*8 :: wall_length, wall_area, transition_arc(2), strike_arc(2), bottom_travel(2)
 logical             :: xpoint, extend
 real*8,external     :: root, spwert
 character*4         :: label
@@ -267,6 +272,12 @@ endif
 allocate(R_wall_max(n_tht+n_leg_total),Z_wall_max(n_tht+n_leg_total),T_wall_par(n_tht+n_leg_total))
 allocate(R_wall_min(n_tht+n_leg_total),Z_wall_min(n_tht+n_leg_total))
 
+! Main-grid polar lines must meet the wall on the magnetic-axis side of
+! the line through the X-point perpendicular to the axis--X-point direction.
+wall_origin = (/R_xpoint(1),Z_xpoint(1)/)
+wall_normal = (/R_axis-R_xpoint(1),Z_axis-Z_xpoint(1)/)
+wall_normal = wall_normal / sqrt(sum(wall_normal**2))
+
 do j=1,n_tht
 
   if (Z_sep(j) .le. Z_axis) then
@@ -279,10 +290,17 @@ do j=1,n_tht
       tht_max = 0.d0
     endif
 
-    call find_wall_crossing(R_wall,Z_wall,n_wall,R_sep(j),Z_wall_max(j),tht_max,Rw,Zw,Tw)
+    call find_wall_crossing_filtered(R_wall,Z_wall,n_wall,R_sep(j),Z_wall_max(j),tht_max,Rw,Zw,Tw, &
+                                    wall_origin,wall_normal,ifail)
   else
     tht_max = theta_sep(j)
-    call find_wall_crossing(R_wall,Z_wall,n_wall,R_sep(j),Z_sep(j),tht_max,Rw,Zw,Tw)
+    call find_wall_crossing_filtered(R_wall,Z_wall,n_wall,R_sep(j),Z_sep(j),tht_max,Rw,Zw,Tw, &
+                                    wall_origin,wall_normal,ifail)
+  endif
+
+  if (ifail /= 0) then
+    write(*,*) 'grid_xpoint_wall: no wall crossing above X-point line for polar index ',j
+    error stop 'Cannot construct main-grid polar line'
   endif
 
   R_wall_max(j) = Rw
@@ -367,7 +385,7 @@ do i=1, n_open + n_private + 1
 
     elseif (Z_wall(k) .eq. Z_wall(k+1)) then
 
-      call find_Z_surface(node_list,element_list,flux_list,i_flux,Rw,i_elm_find,s_find,t_find,st_find,i_find)
+      call find_Z_surface(node_list,element_list,flux_list,i_flux,Zw,i_elm_find,s_find,t_find,st_find,i_find)
 
     else
 
@@ -383,11 +401,14 @@ do i=1, n_open + n_private + 1
       
            .and. ((Z_wall(k)-ZZg1)*(Z_wall(k+1)-ZZg1) .le. 0.d0) )  then
 
-        if ((RRg1 .le. R_xpoint(1)) .and. (ZZg1 .le. Z_axis)) then
+        ! For the two lower-divertor strikes, order by R. On a sloping wall
+        ! both intersections can lie on the same side of R_xpoint.
+        if ((RRg1 .lt. R_strike(i,1)) .and. (ZZg1 .le. Z_axis)) then
             R_strike(i,1) = RRg1
             Z_strike(i,1) = ZZg1
 !            write(*,'(A,i3,2f8.4)') ' INNER strike point : ',i,RRg1,ZZg1
-        elseif ((RRg1 .gt. R_xpoint(1)) .and. (ZZg1 .le. Z_axis)) then
+        endif
+        if ((RRg1 .gt. R_strike(i,2)) .and. (ZZg1 .le. Z_axis)) then
              R_strike(i,2) = RRg1
              Z_strike(i,2) = ZZg1
 !             write(*,'(A,i3,2f8.4)') ' OUTER strike point : ',i,RRg1,ZZg1
@@ -397,6 +418,10 @@ do i=1, n_open + n_private + 1
 
     enddo
   enddo
+  if (R_strike(i,1) >= R_strike(i,2)) then
+    write(*,*) 'grid_xpoint_wall: missing distinct inner/outer strikes for flux surface ',i_flux
+    error stop 'Cannot construct divertor legs without two wall strikes'
+  endif
 enddo
 
 if ( write_ps ) then
@@ -547,15 +572,9 @@ do j=1,n_leg
 enddo
 
 
-do j=1,n_leg_out_loc
-  R_wall_max(j+n_tht+n_leg) = R_wall_max(1) + 0.8d0*(R_max(n_tht+n_leg+1)-R_wall_max(1)) * float(j-1)/float(n_leg_out_loc-1)
-  Z_wall_max(j+n_tht+n_leg) = Z_wall_max(1) + 0.8d0*(Z_max(n_tht+n_leg+1)-Z_wall_max(1)) * float(j-1)/float(n_leg_out_loc-1)
-  tht_max = 0.d0
-  call find_wall_crossing(R_wall,Z_wall,n_wall,R_max(j+n_tht+n_leg)-0.1,Z_wall_max(j+n_tht+n_leg),tht_max,Rw,Zw,Tw)
-  R_wall_max(j+n_tht+n_leg) = Rw
-  Z_wall_max(j+n_tht+n_leg) = Zw
-  T_wall_par(j+n_tht+n_leg) = Tw
-enddo
+! Follow the local wall arc from L9 towards the outer SOL strike. Horizontal
+! searches can jump to a different wall branch, even at the shared L9 endpoint.
+call set_right_leg_wall_points()
 
 
 call plot_flux_surfaces(node_list,element_list,flux_list,.true.,1,xpoint,xcase)
@@ -1187,6 +1206,8 @@ newnode_list%n_nodes = index
 
 if (extend) then
 
+  if (wall_transition_partition) call partition_extension_wall()
+
   write(*,*) ' -- starting with extention to wall -- '
   allocate(elm_left(n_ext),elm_right(n_ext))
 
@@ -1276,6 +1297,9 @@ if (extend) then
       dZtmp = Z_wall_max(j2) - newnode_list%node(index_leg1 + (j-1)*(n_open+n_private+1) - 1)%x(1,1,2)
       Rtmp = newnode_list%node(index_leg1 + (j-1)*(n_open+n_private+1) - 1)%x(1,1,1) + dRtmp * float(i)/float(n_ext)
       Ztmp = newnode_list%node(index_leg1 + (j-1)*(n_open+n_private+1) - 1)%x(1,1,2) + dZtmp * float(i)/float(n_ext)
+      if (wall_transition_partition .and. j == n_leg) then
+        call point_on_wall(strike_arc(1)+real(i,8)/real(n_ext,8)*bottom_travel(1),Rtmp,Ztmp,Tw)
+      endif
 
       tht_bnd = atan2(newnode_list%node(index_leg1+(j-1)*(n_open+n_private+1)-1)%x(1,3,2),&
                       newnode_list%node(index_leg1+(j-1)*(n_open+n_private+1)-1)%x(1,3,1))
@@ -1340,6 +1364,9 @@ if (extend) then
       dZtmp = Z_wall_max(j2) - newnode_list%node(index_leg2 + (n_leg_out_loc-j+1)*(n_open+n_private+1) - 1)%x(1,1,2)
       Rtmp = newnode_list%node(index_leg2 + (n_leg_out_loc-j+1)*(n_open+n_private+1) - 1)%x(1,1,1) + dRtmp * float(i)/float(n_ext)
       Ztmp = newnode_list%node(index_leg2 + (n_leg_out_loc-j+1)*(n_open+n_private+1) - 1)%x(1,1,2) + dZtmp * float(i)/float(n_ext)
+      if (wall_transition_partition .and. j == n_leg_out_loc) then
+        call point_on_wall(strike_arc(2)+real(i,8)/real(n_ext,8)*bottom_travel(2),Rtmp,Ztmp,Tw)
+      endif
 
       tht_bnd = atan2(newnode_list%node(index_leg2 + (n_leg_out_loc-j+1)*(n_open+n_private+1) - 1)%x(1,3,2),&
                       newnode_list%node(index_leg2 + (n_leg_out_loc-j+1)*(n_open+n_private+1) - 1)%x(1,3,1))
@@ -1775,6 +1802,9 @@ do k=1, newelement_list%n_elements   ! fill in the size of the elements
   newelement_list%element(Index)%sons(:)= 0
 enddo
 
+! Limit cubic extension-edge overshoot without moving nodes or changing the core.
+if (extend .and. n_order == 3 .and. .not. wall_transition_partition) call limit_extension_tangents()
+
 ! --- Set element sizes for higher orders
 if (n_order .ge. 5) then
   call set_high_order_sizes(newelement_list)
@@ -1926,7 +1956,8 @@ do i=1, newelement_list%n_elements
 
     iv = newelement_list%element(i)%vertex(j)
 
-    if (newnode_list%node(iv)%boundary .eq. 9) then  ! remove the small edge "triangles"
+    if (newnode_list%node(iv)%boundary .eq. 9 .and. .not. wall_transition_partition) then
+      ! Legacy layout removes corner triangles; the partitioned layout has a real corner node.
       write(*,*) 'removing element : ',i      
       remove_elements(n_remove_elements+1) = i
       n_remove_elements = n_remove_elements + 1
@@ -2027,4 +2058,256 @@ call update_neighbours(node_list,element_list, force_rtree_initialize=.true.)
 write(*,*) ' completed grid_xpoint_wall'
 
 return
+
+contains
+
+subroutine point_on_wall(position,r,z,tangent)
+  real*8, intent(in) :: position
+  real*8, intent(out) :: r,z,tangent
+  real*8 :: s,f,dr,dz
+  integer :: segment
+  s = modulo(position,wall_length)
+  do segment=1,n_wall-1
+    if (wall_arc(segment+1) <= wall_arc(segment)) cycle
+    if (s <= wall_arc(segment+1)) exit
+  enddo
+  f = (s-wall_arc(segment))/(wall_arc(segment+1)-wall_arc(segment))
+  dr = R_wall(segment+1)-R_wall(segment)
+  dz = Z_wall(segment+1)-Z_wall(segment)
+  r = R_wall(segment)+f*dr
+  z = Z_wall(segment)+f*dz
+  if (wall_area < 0.d0) then
+    tangent = atan2(dz,dr)
+  else
+    tangent = atan2(-dz,-dr)
+  endif
+end subroutine point_on_wall
+
+function locate_on_wall(r,z) result(position)
+  real*8, intent(in) :: r,z
+  real*8 :: position,best,distance,dr,dz,f
+  integer :: segment
+  best = huge(1.d0)
+  position = 0.d0
+  do segment=1,n_wall-1
+    dr = R_wall(segment+1)-R_wall(segment)
+    dz = Z_wall(segment+1)-Z_wall(segment)
+    if (wall_arc(segment+1) <= wall_arc(segment)) cycle
+    f = max(0.d0,min(1.d0,((r-R_wall(segment))*dr+(z-Z_wall(segment))*dz)/(dr*dr+dz*dz)))
+    distance = hypot(r-R_wall(segment)-f*dr,z-Z_wall(segment)-f*dz)
+    if (distance < best) then
+      best = distance
+      position = wall_arc(segment)+f*(wall_arc(segment+1)-wall_arc(segment))
+    endif
+  enddo
+  if (best > 1.d-6) error stop 'Wall transition or anchor is not on the wall (tolerance 1 micron)'
+end function locate_on_wall
+
+subroutine partition_extension_wall()
+  integer, parameter :: samples=1001
+  real*8 :: anchors(2,2),start,travel,span,width,direction,s,turn,best,u,f,progress
+  real*8 :: r,z,tangent,previous(2),current(2),following(2),before(2),after(2)
+  integer :: side,segment,sample,point,offset,npoints
+  character(len=5), parameter :: labels(2) = (/'left ','right'/)
+
+  if (wall_transition_window <= 0.d0) error stop 'wall_transition_window must be positive'
+  if (n_wall < 3) error stop 'Wall transition detection requires a closed contour'
+  if (hypot(R_wall(n_wall)-R_wall(1),Z_wall(n_wall)-Z_wall(1)) > 1.d-8) &
+    error stop 'Wall transition detection requires a closed contour'
+  allocate(wall_arc(n_wall))
+  wall_arc(1) = 0.d0
+  wall_area = 0.d0
+  do segment=1,n_wall-1
+    wall_arc(segment+1) = wall_arc(segment)+hypot(R_wall(segment+1)-R_wall(segment), &
+                                                 Z_wall(segment+1)-Z_wall(segment))
+    wall_area = wall_area+(R_wall(segment+1)-R_wall(segment))*(Z_wall(segment+1)+Z_wall(segment))
+  enddo
+  wall_length = wall_arc(n_wall)
+  if (wall_length <= 0.d0) error stop 'Wall contour has zero length'
+  anchors(:,1) = (/RL8,ZL8/)
+  anchors(:,2) = (/RL9,ZL9/)
+
+  do side=1,2
+    start = locate_on_wall(anchors(1,side),anchors(2,side))
+    strike_arc(side) = locate_on_wall(R_strike(n_open+1,side),Z_strike(n_open+1,side))
+    travel = modulo(strike_arc(side)-start+0.5d0*wall_length,wall_length)-0.5d0*wall_length
+    span = abs(travel)
+    if (span < 1.d-6) error stop 'Wall transition search interval is too short'
+    direction = sign(1.d0,travel)
+    width = min(wall_transition_window,0.1d0*span)
+    if (wall_transition_R(side) >= 0.d0) then
+      transition_arc(side) = locate_on_wall(wall_transition_R(side),wall_transition_Z(side))
+      progress = modulo(direction*(transition_arc(side)-start),wall_length)
+      if (progress <= 0.d0 .or. progress >= span) error stop 'Wall transition override is outside the divertor arc'
+      transition_arc(side) = start+direction*progress
+    else
+      best = -1.d0
+      do sample=1,samples
+        u = width+(span-2.d0*width)*real(sample-1,8)/real(samples-1,8)
+        s = start+direction*u
+        call point_on_wall(s-direction*width,previous(1),previous(2),tangent)
+        call point_on_wall(s,current(1),current(2),tangent)
+        call point_on_wall(s+direction*width,following(1),following(2),tangent)
+        before = current-previous
+        after = following-current
+        turn = abs(atan2(before(1)*after(2)-before(2)*after(1),sum(before*after)))
+        if (turn > best) then
+          best = turn
+          transition_arc(side) = s
+        endif
+      enddo
+      if (best < 1.d-3) error stop 'No distinct wall bend found; supply wall_transition_R/Z override'
+    endif
+    call point_on_wall(transition_arc(side),r,z,tangent)
+    write(*,'(A,A,A,2F16.10)') 'Wall transition ',trim(labels(side)),': R,Z [m] = ',r,z
+    bottom_travel(side) = transition_arc(side)-(start+travel)
+    offset = n_tht
+    npoints = n_leg
+    if (side == 2) then
+      offset = n_tht+n_leg
+      npoints = n_leg_out_loc
+    endif
+    if (npoints < 2) error stop 'Wall partition requires at least two leg polar lines'
+    do point=1,npoints
+      f = real(point-1,8)/real(npoints-1,8)
+      call point_on_wall(start+f*(transition_arc(side)-start), &
+                        R_wall_max(offset+point),Z_wall_max(offset+point),T_wall_par(offset+point))
+    enddo
+    R_wall_max(offset+1) = anchors(1,side)
+    Z_wall_max(offset+1) = anchors(2,side)
+  enddo
+end subroutine partition_extension_wall
+
+subroutine limit_extension_tangents()
+  integer, parameter :: nsample=21, max_passes=12
+  real*8 :: h(4,n_degrees,nsample,nsample), hs(4,n_degrees,nsample,nsample)
+  real*8 :: ht(4,n_degrees,nsample,nsample), ds(2), dt(2), p(2,4), jac, orientation
+  logical :: shorten(newnode_list%n_nodes), invalid
+  integer :: pass, e, v, d, a, b, n, bad, adjusted
+
+  do a=1,nsample
+    do b=1,nsample
+      call basisfunctions(real(a-1,8)/real(nsample-1,8),real(b-1,8)/real(nsample-1,8), &
+                          h(:,:,a,b),hs(:,:,a,b),ht(:,:,a,b))
+    enddo
+  enddo
+
+  do pass=0,max_passes
+    shorten = .false.
+    bad = 0
+    do e=1,newelement_list%n_elements
+      if (all(newelement_list%element(e)%vertex(1:4) < index_ext2)) cycle
+      ! These corner triangles are deliberately removed before copying the grid.
+      if (any(newnode_list%node(newelement_list%element(e)%vertex(1:4))%boundary == 9)) cycle
+      do v=1,4
+        p(:,v) = newnode_list%node(newelement_list%element(e)%vertex(v))%x(1,1,:)
+      enddo
+      ds = p(:,2)-p(:,1)+p(:,3)-p(:,4)
+      dt = p(:,4)-p(:,1)+p(:,3)-p(:,2)
+      orientation = sign(1.d0,ds(1)*dt(2)-ds(2)*dt(1))
+      invalid = .false.
+      do a=1,nsample
+        do b=1,nsample
+          ds = 0.d0
+          dt = 0.d0
+          do v=1,4
+            n = newelement_list%element(e)%vertex(v)
+            do d=1,n_degrees
+              ds = ds + newnode_list%node(n)%x(1,d,:)*newelement_list%element(e)%size(v,d)*hs(v,d,a,b)
+              dt = dt + newnode_list%node(n)%x(1,d,:)*newelement_list%element(e)%size(v,d)*ht(v,d,a,b)
+            enddo
+          enddo
+          jac = orientation*(ds(1)*dt(2)-ds(2)*dt(1))
+          if (.not. (jac > 0.d0)) invalid = .true.
+        enddo
+      enddo
+      if (.not. invalid) cycle
+      bad = bad+1
+      do v=1,4
+        n = newelement_list%element(e)%vertex(v)
+        if (n >= index_ext2) shorten(n) = .true.
+      enddo
+    enddo
+    if (bad == 0) return
+    if (pass == max_passes) error stop 'Cannot remove extension-grid folding by limiting tangents'
+    adjusted = count(shorten)
+    if (adjusted == 0) error stop 'Extension-grid folding requires changing the core grid'
+    write(*,*) 'Extension tangent limiter: pass, folded elements, shared nodes: ',pass+1,bad,adjusted
+    do n=index_ext2,newnode_list%n_nodes
+      if (.not. shorten(n)) cycle
+      ! Change the shared node, not per-element sizes, so common edges still match.
+      newnode_list%node(n)%x(1,3:4,:) = 0.5d0*newnode_list%node(n)%x(1,3:4,:)
+    enddo
+  enddo
+end subroutine limit_extension_tangents
+
+subroutine set_right_leg_wall_points()
+  real*8 :: arc(n_wall), length, area, fraction, distance, best_distance
+  real*8 :: endpoints(2,2), endpoint_arc(2), dr, dz, projected_r, projected_z
+  real*8 :: travel, position, weight
+  integer :: p, segment, point, target
+
+  if (n_leg_out_loc < 2) error stop 'Right leg requires at least two polar lines'
+  if (hypot(R_wall(n_wall)-R_wall(1),Z_wall(n_wall)-Z_wall(1)) > 1.d-8) &
+    error stop 'Right-leg wall interpolation requires a closed wall contour'
+
+  arc(1) = 0.d0
+  area = 0.d0
+  do segment=1,n_wall-1
+    arc(segment+1) = arc(segment) + hypot(R_wall(segment+1)-R_wall(segment), &
+                                         Z_wall(segment+1)-Z_wall(segment))
+    area = area + (R_wall(segment+1)-R_wall(segment))*(Z_wall(segment+1)+Z_wall(segment))
+  enddo
+  length = arc(n_wall)
+  if (length <= 0.d0) error stop 'Wall contour has zero length'
+
+  endpoints(:,1) = (/RL9,ZL9/)
+  endpoints(:,2) = (/R_strike(n_open+1,2),Z_strike(n_open+1,2)/)
+  do p=1,2
+    best_distance = huge(1.d0)
+    do segment=1,n_wall-1
+      dr = R_wall(segment+1)-R_wall(segment)
+      dz = Z_wall(segment+1)-Z_wall(segment)
+      if (arc(segment+1) <= arc(segment)) cycle
+      fraction = ((endpoints(1,p)-R_wall(segment))*dr + (endpoints(2,p)-Z_wall(segment))*dz)/(dr*dr+dz*dz)
+      fraction = max(0.d0,min(1.d0,fraction))
+      projected_r = R_wall(segment)+fraction*dr
+      projected_z = Z_wall(segment)+fraction*dz
+      distance = hypot(projected_r-endpoints(1,p),projected_z-endpoints(2,p))
+      if (distance < best_distance) then
+        best_distance = distance
+        endpoint_arc(p) = arc(segment)+fraction*(arc(segment+1)-arc(segment))
+      endif
+    enddo
+    if (best_distance > 1.d-6) error stop 'Right-leg anchor is not on the wall contour'
+  enddo
+
+  ! The local divertor section is the shorter of the two arcs on the closed wall.
+  travel = modulo(endpoint_arc(2)-endpoint_arc(1)+0.5d0*length,length)-0.5d0*length
+  do point=1,n_leg_out_loc
+    weight = 0.8d0*real(point-1,8)/real(n_leg_out_loc-1,8)
+    position = modulo(endpoint_arc(1)+weight*travel,length)
+    do segment=1,n_wall-1
+      if (arc(segment+1) <= arc(segment)) cycle
+      if (position <= arc(segment+1)) exit
+    enddo
+    fraction = (position-arc(segment))/(arc(segment+1)-arc(segment))
+    dr = R_wall(segment+1)-R_wall(segment)
+    dz = Z_wall(segment+1)-Z_wall(segment)
+    target = n_tht+n_leg+point
+    R_wall_max(target) = R_wall(segment)+fraction*dr
+    Z_wall_max(target) = Z_wall(segment)+fraction*dz
+    ! Match find_wall_crossing's contour-orientation convention, not arc travel.
+    if (area < 0.d0) then
+      T_wall_par(target) = atan2(dz,dr)
+    else
+      T_wall_par(target) = atan2(-dz,-dr)
+    endif
+  enddo
+  ! Preserve exact continuity with the main grid at the X-point dividing line.
+  R_wall_max(n_tht+n_leg+1) = RL9
+  Z_wall_max(n_tht+n_leg+1) = ZL9
+  T_wall_par(1) = T_wall_par(n_tht+n_leg+1)
+end subroutine set_right_leg_wall_points
+
 end subroutine grid_xpoint_wall
