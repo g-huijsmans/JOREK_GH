@@ -1663,7 +1663,8 @@ do i=1,n_vertex_max
                        - v * F0 / BigR * r0 * vpar0_p                                                                     * xjac * tstep * factor(var_rho,3) &
                        - v * r0 * (vpar0_s * ps0_t - vpar0_t * ps0_s)                                                            * tstep * factor(var_rho,3) &
 
-                       + v * 2.d0 * tauIC*2. * Pi0_y * BigR                                                               * xjac * tstep * factor(var_rho,7) &
+!                       + v * 2.d0 * tauIC*2. * Pi0_y * BigR                                                               * xjac * tstep * factor(var_rho,7) &
+                       - tauIC*2.d0 * BigR**2 * (v_x*Pi0_y - v_y*Pi0_x)                                                   * xjac * tstep * factor(var_rho,7) &
 
                        + v * (r0+alpha_e*rimp0) * rn0 * BigR * Sion_T                                                     * xjac * tstep * factor(var_rho,8) &
                        - v * (r0+alpha_e*rimp0) * (r0-rimp0) * BigR * Srec_T                                              * xjac * tstep * factor(var_rho,9) &
@@ -2776,7 +2777,8 @@ do i=1,n_vertex_max
                           + v * rho * (vpar0_s * ps0_t - vpar0_t * ps0_s)                                      * theta * tstep &
                           + v * rho * F0 / BigR * vpar0_p                                               * xjac * theta * tstep &
 
-                          - v * 2.d0 * tauIC*2. * (rho_y * Ti0 + rho*Ti0_y) * BigR                         * xjac * theta * tstep &
+!                          - v * 2.d0 * tauIC*2. * (rho_y * Ti0 + rho*Ti0_y) * BigR                         * xjac * theta * tstep &
+                          + tauIC*2.d0 * BigR**2 * (v_x*(Ti0_y * rho + Ti0 * rho_y) - v_y*(Ti0_x * rho + Ti0 * rho_x))                              * xjac * theta * tstep &
 
                           - v * rho * rn0       * BigR * Sion_T                                         * xjac * theta * tstep &
                           + v * rho * (2.d0*r0 +(alpha_e-1.)*rimp0) * BigR * Srec_T                     * xjac * theta * tstep &
@@ -2813,11 +2815,16 @@ do i=1,n_vertex_max
                                     * ( + F0 / BigR * v_p) * xjac * theta * tstep * tstep
 
                   if ( with_TiTe ) then
-                    amat(var_rho,var_Ti) = - v * 2.d0 * tauIC*2. * (Ti_y * r0 + Ti*r0_y) * BigR         * xjac * theta * tstep
-                    amat(var_rho,var_Te) = - v * BigR * (r0+alpha_e*rimp0) * rn0 * dSion_dT * Te        * xjac * theta * tstep &
+!                    amat(var_rho,var_Ti) = - v * 2.d0 * tauIC*2. * (Ti_y * r0 + Ti*r0_y) * BigR         * xjac * theta * tstep
+ 
+                   amat(var_rho,var_Ti) = + tauIC*2.d0 * BigR**2 * (v_x*(r0 * Ti_y + r0_y * Ti) - v_y*(r0 * Ti_x + r0_x * Ti)) * xjac * theta * tstep 
+                   amat(var_rho,var_Te) = - v * BigR * (r0+alpha_e*rimp0) * rn0 * dSion_dT * Te        * xjac * theta * tstep &
                                            + v * BigR * (r0+alpha_e*rimp0) * (r0-rimp0) * dSrec_dT * Te * xjac * theta * tstep
                   else ! (with_TiTe)
-                    amat(var_rho,var_T)  = - v * 2.d0 * tauIC * (T_y  * r0 + T *r0_y) * BigR            * xjac * theta * tstep &
+!                    amat(var_rho,var_T)  = - v * 2.d0 * tauIC * (T_y  * r0 + T *r0_y) * BigR            * xjac * theta * tstep &
+!                                           - v * BigR * (r0+alpha_e*rimp0) * rn0 * dSion_dT * T         * xjac * theta * tstep &
+!                                           + v * BigR * (r0+alpha_e*rimp0) * (r0-rimp0) * dSrec_dT * T  * xjac * theta * tstep 
+                    amat(var_rho,var_T)  = + tauIC * BigR**2 * (v_x*(r0 * T_y + r0_y * T) - v_y*(r0 * T_x + r0_x * T))     * xjac * theta * tstep  &                  
                                            - v * BigR * (r0+alpha_e*rimp0) * rn0 * dSion_dT * T         * xjac * theta * tstep &
                                            + v * BigR * (r0+alpha_e*rimp0) * (r0-rimp0) * dSrec_dT * T  * xjac * theta * tstep 
                   end if ! (with_TiTe)
