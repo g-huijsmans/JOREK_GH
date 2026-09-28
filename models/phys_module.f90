@@ -311,6 +311,11 @@ module phys_module
   real*8  :: heatsource_gauss_i_sig(5)     !< Width over which ions Gaussian source extends
   real*8  :: constant_imp_source           !< Adds a constant impurity source
   
+#if JOREK_MODEL == 600
+  ! --- Hyper-filters for the current and vorticity definitions
+  real*8  :: filter_current_hyper, filter_vorticity_hyper
+#endif
+
   !> @name Hyper-resistivity, -viscosity and -diffusivities
   real*8  :: eta_num, visco_num, visco_par_num,                                      &
              D_perp_num, D_perp_num_tanh, D_perp_num_tanh_psin, D_perp_num_tanh_sig, &

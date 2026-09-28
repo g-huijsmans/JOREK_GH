@@ -68,7 +68,7 @@ real*8, dimension(0:n_var,0:n_var) :: amat, amat_k, amat_n, amat_kn, amat_nn
 
 real*8     :: v, v_x, v_y, v_s, v_t, v_p, v_ss, v_st, v_tt, v_xx, v_xy, v_yy
 real*8     :: ps0, ps0_x, ps0_y, ps0_p, ps0_s, ps0_t, ps0_ss, ps0_tt, ps0_st, ps0_xx, ps0_yy, ps0_xy
-real*8     :: zj0, zj0_x, zj0_y, zj0_p, zj0_s, zj0_t
+real*8     :: zj0, zj0_x, zj0_y, zj0_p, zj0_s, zj0_t, zj0_ss, zj0_st, zj0_tt, zj0_xx, zj0_yy
 real*8     :: u0, u0_x, u0_y, u0_p, u0_s, u0_t, u0_ss, u0_tt, u0_st, u0_xx, u0_xy, u0_yy, u0_xpp, u0_ypp
 real*8     :: w0, w0_x, w0_y, w0_p, w0_s, w0_t, w0_ss, w0_st, w0_tt, w0_xx, w0_xy, w0_yy
 real*8     :: r0, r0_x, r0_y, r0_p, r0_s, r0_t, r0_ss, r0_st, r0_tt, r0_xx, r0_xy, r0_yy, r0_hat, r0_x_hat, r0_y_hat, r0_corr
@@ -77,7 +77,9 @@ real*8     :: Ti0, Ti0_x, Ti0_y, Ti0_p, Ti0_s, Ti0_t, Ti0_ss, Ti0_st, Ti0_tt, Ti
 real*8     :: Te0, Te0_x, Te0_y, Te0_p, Te0_s, Te0_t, Te0_ss, Te0_st, Te0_tt, Te0_xx, Te0_xy, Te0_yy, Te0_corr, dTe0_corr_dT, d2Te0_corr_dT2
 real*8     :: Tie_min_neg
 real*8     :: psi, psi_x, psi_y, psi_p, psi_s, psi_t, psi_ss, psi_st, psi_tt, psi_xx, psi_xy, psi_yy, psi_xpp, psi_ypp
-real*8     :: zj, zj_x, zj_y, zj_p, zj_s, zj_t, zj_ss, zj_st, zj_tt
+real*8     :: zj, zj_x, zj_y, zj_p, zj_s, zj_t, zj_ss, zj_st, zj_tt, zj_xx, zj_yy
+real*8     :: lapstar_v, lapstar_zj0, lapstar_zj
+real*8     :: lappol_v, lappol_w0, lappol_w
 real*8     :: u, u_x, u_y, u_p, u_s, u_t, u_ss, u_st, u_tt, u_xx, u_xy, u_yy, u_xpp, u_ypp
 real*8     :: w, w_x, w_y, w_p, w_s, w_t, w_ss, w_st, w_tt, w_xx, w_xy, w_yy
 real*8     :: rho, rho_x, rho_y, rho_s, rho_t, rho_p, rho_hat, rho_x_hat, rho_y_hat, rho_ss, rho_st, rho_tt, rho_xx, rho_xy, rho_yy
@@ -563,6 +565,9 @@ do i=1,n_vertex_max
           zj0_p = eq_p(mp,var_zj,ms,mt)
           zj0_s = eq_s(mp,var_zj,ms,mt)
           zj0_t = eq_t(mp,var_zj,ms,mt)
+          zj0_ss = eq_ss(mp,var_zj,ms,mt)
+          zj0_st = eq_st(mp,var_zj,ms,mt)
+          zj0_tt = eq_tt(mp,var_zj,ms,mt)
 
 
           w0    = eq_g(mp,var_w,ms,mt)
@@ -929,6 +934,16 @@ do i=1,n_vertex_max
                    - ps0_t * (x_st(ms,mt)*y_s(ms,mt)  - x_ss(ms,mt)*y_t(ms,mt) ) )  / xjac**2             &
                    - xjac_x * (- ps0_s * x_t(ms,mt) + ps0_t * x_s(ms,mt) )   / xjac**2
 
+          zj0_xx = (zj0_ss * y_t(ms,mt)**2 - 2.d0*zj0_st * y_s(ms,mt)*y_t(ms,mt) + zj0_tt * y_s(ms,mt)**2     &
+                 + zj0_s * (y_st(ms,mt)*y_t(ms,mt) - y_tt(ms,mt)*y_s(ms,mt) )                              &
+                 + zj0_t * (y_st(ms,mt)*y_s(ms,mt) - y_ss(ms,mt)*y_t(ms,mt) ) )     / xjac**2              &
+                 - xjac_x * (zj0_s* y_t(ms,mt) - zj0_t * y_s(ms,mt))  / xjac**2
+
+          zj0_yy = (zj0_ss * x_t(ms,mt)**2 - 2.d0*zj0_st * x_s(ms,mt)*x_t(ms,mt) + zj0_tt * x_s(ms,mt)**2     &
+                 + zj0_s * (x_st(ms,mt)*x_t(ms,mt) - x_tt(ms,mt)*x_s(ms,mt) )                              &
+                 + zj0_t * (x_st(ms,mt)*x_s(ms,mt) - x_ss(ms,mt)*x_t(ms,mt) ) )     / xjac**2              &
+                 - xjac_y * (- zj0_s * x_t(ms,mt) + zj0_t * x_s(ms,mt) )  / xjac**2
+
           w0_xx = (w0_ss * y_t(ms,mt)**2 - 2.d0*w0_st * y_s(ms,mt)*y_t(ms,mt) + w0_tt * y_s(ms,mt)**2     &
                  + w0_s * (y_st(ms,mt)*y_t(ms,mt) - y_tt(ms,mt)*y_s(ms,mt) )                              &
                  + w0_t * (y_st(ms,mt)*y_s(ms,mt) - y_ss(ms,mt)*y_t(ms,mt) ) )     / xjac**2              &
@@ -938,6 +953,9 @@ do i=1,n_vertex_max
                  + w0_s * (x_st(ms,mt)*x_t(ms,mt) - x_tt(ms,mt)*x_s(ms,mt) )                              &
                  + w0_t * (x_st(ms,mt)*x_s(ms,mt) - x_ss(ms,mt)*x_t(ms,mt) ) )     / xjac**2              &
                  - xjac_y * (- w0_s * x_t(ms,mt) + w0_t * x_s(ms,mt) )  / xjac**2
+
+          lapstar_zj0 = zj0_xx - zj0_x/BigR + zj0_yy
+          lappol_w0 = w0_xx + w0_x/BigR + w0_yy
 
           w0_xy = (- w0_ss * y_t(ms,mt)*x_t(ms,mt) - w0_tt * x_s(ms,mt)*y_s(ms,mt)                        &
                    + w0_st * (y_s(ms,mt)*x_t(ms,mt)  + y_t(ms,mt)*x_s(ms,mt)  )                           &
@@ -1515,6 +1533,9 @@ do i=1,n_vertex_max
                    - v_t  * (x_st(ms,mt)*y_s(ms,mt) - x_ss(ms,mt)*y_t(ms,mt) )  )  / xjac**2           &
                    - xjac_x * (- v_s * x_t(ms,mt) + v_t * x_s(ms,mt) )   / xjac**2
 
+            lapstar_v = v_xx - v_x/BigR + v_yy
+            lappol_v = v_xx + v_x/BigR + v_yy
+
             Bgrad_rho_star   = ( v_x  * ps0_y - v_y  * ps0_x ) / BigR                         
             Bgrad_rho_k_star = ( F0 / BigR * v_p )           / BigR                           
             Bgrad_rho        = ( F0 / BigR * r0_p +  r0_x * ps0_y - r0_y * ps0_x ) / BigR
@@ -1639,13 +1660,17 @@ do i=1,n_vertex_max
             !#  Current Definition Equation                                                                    #
             !###################################################################################################
 
-            rhs_ij(var_zj) = - ( v_x * ps0_x  + v_y * ps0_y + v*zj0) / BigR * xjac * factor(var_zj,1)
+            rhs_ij(var_zj) = - ( v_x * ps0_x + v_y * ps0_y + v*zj0                         &
+                                + filter_current_hyper * lapstar_v * lapstar_zj0 )          &
+                                / BigR * xjac * factor(var_zj,1)
 
             !###################################################################################################
             !#  Vorticity Definition Equation                                                                  #
             !###################################################################################################
 
-            rhs_ij(var_w) = - ( v_x * u0_x   + v_y * u0_y  + v*w0)  * BigR * xjac * factor(var_w,1)
+            rhs_ij(var_w) = - ( v_x * u0_x + v_y * u0_y + v*w0                            &
+                               + filter_vorticity_hyper * lappol_v * lappol_w0 )          &
+                               * BigR * xjac * factor(var_w,1)
 
             !###################################################################################################
             !#  Density Equation                                                                               #
@@ -2306,10 +2331,13 @@ do i=1,n_vertex_max
                   u_tt = psi_tt ;  zj_tt = psi_tt ;  w_tt = psi_tt ; rho_tt = psi_tt ;  Ti_tt = psi_tt ; vpar_tt = psi_tt; Te_tt = psi_tt; T_tt = psi_tt;  rhoimp_tt = psi_tt ;
                   u_st = psi_st ;  zj_st = psi_st ;  w_st = psi_st ; rho_st = psi_st ;  Ti_st = psi_st ; vpar_st = psi_st; Te_st = psi_st; T_st = psi_st;  rhoimp_st = psi_st ;
 
-                  u_xx = psi_xx ;                    w_xx = psi_xx ; rho_xx = psi_xx ;  Ti_xx = psi_xx ; vpar_xx = psi_xx; Te_xx = psi_xx; T_xx = psi_xx;  rhoimp_xx = psi_xx ;
-                  u_yy = psi_yy ;                    w_yy = psi_yy ; rho_yy = psi_yy ;  Ti_yy = psi_yy ; vpar_yy = psi_yy; Te_yy = psi_yy; T_yy = psi_yy;  rhoimp_yy = psi_yy ;
+                  u_xx = psi_xx ;  zj_xx = psi_xx ;  w_xx = psi_xx ; rho_xx = psi_xx ;  Ti_xx = psi_xx ; vpar_xx = psi_xx; Te_xx = psi_xx; T_xx = psi_xx;  rhoimp_xx = psi_xx ;
+                  u_yy = psi_yy ;  zj_yy = psi_yy ;  w_yy = psi_yy ; rho_yy = psi_yy ;  Ti_yy = psi_yy ; vpar_yy = psi_yy; Te_yy = psi_yy; T_yy = psi_yy;  rhoimp_yy = psi_yy ;
                   u_xy = psi_xy ;                    w_xy = psi_xy ; rho_xy = psi_xy ;  Ti_xy = psi_xy ; vpar_xy = psi_xy; Te_xy = psi_xy; T_xy = psi_xy;  rhoimp_xy = psi_xy ;
                   u_xpp= psi_xpp;  u_ypp = psi_ypp
+
+                  lapstar_zj = zj_xx - zj_x/BigR + zj_yy
+                  lappol_w = w_xx + w_x/BigR + w_yy
 
                   rhon   = psi
                   rhon_x = psi_x
@@ -2719,14 +2747,18 @@ do i=1,n_vertex_max
                   !#  Current Definition Equation                                                                    #
                   !###################################################################################################
 
-                  amat(var_zj,var_zj) = v * zj / BigR * xjac
+                  amat(var_zj,var_zj) = ( v*zj                                                   &
+                                        + filter_current_hyper * lapstar_v * lapstar_zj )        &
+                                        / BigR * xjac
                   amat(var_zj,var_psi) = (v_x * psi_x + v_y * psi_y ) / BigR * xjac
 
                   !###################################################################################################
                   !#  Vorticity Definition Equation                                                                  #
                   !###################################################################################################
 
-                  amat(var_w,var_w) =  v * w * BigR * xjac                                
+                  amat(var_w,var_w) = ( v*w                                                     &
+                                       + filter_vorticity_hyper * lappol_v * lappol_w )          &
+                                       * BigR * xjac
                   amat(var_w,var_u) = (v_x * u_x + v_y * u_y) * BigR * xjac              
 
                   !###################################################################################################

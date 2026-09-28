@@ -79,6 +79,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 heatsource_e, heatsource_i, heatsource,             &
                 particlesource, tauIC, Wdia,                        &
                 eta_num, visco_num, visco_par_num,                  &
+                filter_current_hyper, filter_vorticity_hyper,       &
                 D_perp_num,  D_perp_num_tanh,                       &
                 D_perp_num_tanh_psin, D_perp_num_tanh_sig,          &
                 ZK_perp_num, ZK_perp_num_tanh,                      &
@@ -236,6 +237,8 @@ if (my_id .eq. 0) then
   call vacuum_preset(my_id, freeboundary_equil, freeboundary, resistive_wall)
   
   ! --- Model-specific presets
+  filter_current_hyper = 0.d0
+  filter_vorticity_hyper = 0.d0
   particlesource_psin = 100.d0
   
   ! --- Read input parameters from namelist.

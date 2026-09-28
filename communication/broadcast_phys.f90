@@ -191,6 +191,10 @@ if (my_id .eq. 0) then
 
   call MPI_PACK(eta_num,                1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(visco_num,              1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+#if JOREK_MODEL == 600
+  call MPI_PACK(filter_current_hyper, 1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+  call MPI_PACK(filter_vorticity_hyper, 1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
+#endif
   call MPI_PACK(visco_par_num,          1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(D_perp_num,             1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
   call MPI_PACK(D_perp_num_tanh,        1,MPI_REAL8,buffer,bufsize,position,MPI_COMM_WORLD,ierr)
@@ -1179,6 +1183,10 @@ if (my_id .ne. 0) then
 
   call MPI_UNPACK(buffer,bufsize,position,eta_num,                1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,visco_num,              1,MPI_REAL8,MPI_COMM_WORLD,ierr)
+#if JOREK_MODEL == 600
+  call MPI_UNPACK(buffer,bufsize,position,filter_current_hyper, 1,MPI_REAL8,MPI_COMM_WORLD,ierr)
+  call MPI_UNPACK(buffer,bufsize,position,filter_vorticity_hyper, 1,MPI_REAL8,MPI_COMM_WORLD,ierr)
+#endif
   call MPI_UNPACK(buffer,bufsize,position,visco_par_num,          1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,D_perp_num,             1,MPI_REAL8,MPI_COMM_WORLD,ierr)
   call MPI_UNPACK(buffer,bufsize,position,D_perp_num_tanh,        1,MPI_REAL8,MPI_COMM_WORLD,ierr)
