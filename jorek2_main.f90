@@ -354,7 +354,27 @@ mpi_required = 0
   ! This is necessary for the parallel vacuum version during the code restart 
   if(restart) then
     call broadcast_phys(my_id)  
+
+    if (restart_equilibrium) then
+
+      write(*,*) '*****************************'
+      write(*,*) '* equilibrium after restart *'
+      write(*,*) '*****************************'
+
+      call equilibrium(my_id,node_list,element_list,bnd_node_list,bnd_elm_list,xpoint,xcase, .true.)
+
+      call broadcast_boundary(my_id,bnd_elm_list,bnd_node_list)
+
+       ! --- Update the status of the equilibrium
+      call update_equil_state(my_id,node_list, element_list, bnd_elm_list, xpoint, xcase)
+
+      ! --- Set initial conditions for time-evolution
+      call initial_conditions(my_id,node_list,element_list,bnd_node_list, bnd_elm_list, xpoint,xcase)
+   
+    endif
+
     if(freeboundary) call broadcast_vacuum(my_id, resistive_wall)
+
   end if
 
 #ifdef USE_NO_TREE
@@ -427,6 +447,9 @@ mpi_required = 0
           fileout = 'jorek_equil_rz'
           call export_restart(node_list, element_list, fileout)
         end if
+
+        if (export_polar_grid) call export_restart(node_list, element_list, 'jorek_polar')
+
       end if ! if (equil) then
 
     else

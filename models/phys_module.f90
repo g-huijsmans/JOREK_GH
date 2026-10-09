@@ -74,6 +74,8 @@ module phys_module
   integer :: rst_format           !< 0 == old format, 1 == new format for restart file
   integer :: n_tor_restart        !< Number of toroidal harmonics read in the restart file
   logical :: restart              !< Restart a code run from the restart file jorek_restart.h5?
+  logical :: restart_equilibrium  !< Recompute the equilibrium when restarting a code run
+  logical :: export_polar_grid    !< Export the polar grid to the jorek_polar restart file
   logical :: regrid               !< Re-generate the flux-aligned grid (does not work currently)?
   logical :: regrid_from_rz       !< Re-generate the flux-aligned grid from an rz equilibrium
   logical :: import_equil         !< (presently unused)

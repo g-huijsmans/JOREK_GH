@@ -58,6 +58,8 @@ subroutine preset_parameters
 
   n_tor_restart= 0
   restart      = .false.
+  restart_equilibrium = .false.
+  export_polar_grid = .false.
   import_equil = .false.
   regrid       = .false.
   regrid_from_rz = .false.
