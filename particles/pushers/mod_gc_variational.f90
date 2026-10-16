@@ -422,7 +422,7 @@ enddo
 return
 end
 
-subroutine push_gc_rk4(fields, particle_gc, mass, timestep, n_steps, n_gyro_phases, gyro_shift)
+subroutine push_gc_rk4(fields, particle_gc, mass, timestep, n_steps, n_gyro_phases, gyro_shift, lost_st, lost_phi)
 use nodes_elements
 use mod_find_rz_nearby
 use mod_fields, only: fields_base
@@ -434,6 +434,8 @@ real*8, intent(in)     :: mass          ! [amu]
 integer, intent(in)    :: n_steps       ! number of time steps 
 integer, intent(in)    :: n_gyro_phases ! number of gyro phases for gyro-averaging
 real*8, intent(out), optional :: gyro_shift(3) ! shift of the gyro centre from guiding centre
+! Optional wall metadata; leave accepted particle state and legacy callers unchanged.
+real*8, intent(out), optional :: lost_st(2), lost_phi
 
 real*8 :: A_0(3), dA_0(3,3), B_0(3), dB_0(3,3), bn_0, dbn_0(3), Bnorm_0(3), dBnorm_0(3,3), E_0(3)
 real*8 :: A_1(3), dA_1(3,3), B_1(3), dB_1(3,3), bn_1, dbn_1(3), Bnorm_1(3), dBnorm_1(3,3), E_1(3)
@@ -451,6 +453,8 @@ qom = particle_gc%q * EL_CHG / (mass * ATOMIC_MASS_UNIT)
 
 if (present(gyro_shift)) gyro_shift = 0.d0
 
+if (present(lost_st)) lost_st = particle_gc%st
+if (present(lost_phi)) lost_phi = particle_gc%x(3)
 if (particle_gc%i_elm .le. 0) return
 
 n_phases = n_gyro_phases
@@ -483,6 +487,8 @@ do i =1, n_steps
                                                
   if (p_1%i_elm .le. 0) then
     particle_gc%i_elm = p_1%i_elm
+    if (present(lost_st)) lost_st = p_1%st
+    if (present(lost_phi)) lost_phi = p_1%x(3)
     return
   endif
     
@@ -501,6 +507,8 @@ do i =1, n_steps
                                                p_2%x(1), p_2%x(2), p_2%st(1), p_2%st(2), p_2%i_elm, ifail)
   if (p_2%i_elm .le. 0) then
     particle_gc%i_elm = p_2%i_elm
+    if (present(lost_st)) lost_st = p_2%st
+    if (present(lost_phi)) lost_phi = p_2%x(3)
     return
   endif
   
@@ -520,6 +528,8 @@ do i =1, n_steps
 
   if (p_3%i_elm .le. 0) then
     particle_gc%i_elm = p_3%i_elm
+    if (present(lost_st)) lost_st = p_3%st
+    if (present(lost_phi)) lost_phi = p_3%x(3)
     return
   endif
   
@@ -540,6 +550,8 @@ do i =1, n_steps
 
   if (p_0%i_elm .le. 0) then
     particle_gc%i_elm = p_0%i_elm
+    if (present(lost_st)) lost_st = p_0%st
+    if (present(lost_phi)) lost_phi = p_0%x(3)
     return
   endif
 

@@ -9,6 +9,8 @@ end module
 program jorek_gk_neutrals
 use mod_particle_types
 use mod_particle_sim
+use mod_gk_neutral_recycling, only: gk_neutral_recycling_state, initialize_gk_neutral_recycling, &
+                                    recycle_lost_gk_ions, report_gk_neutral_recycling
 use mod_gk_neutrals, only: gk_neutral_state, initialize_gk_neutrals, advance_gk_neutrals, &
                            report_gk_neutral_diagnostics
 use mod_particle_allocation, only: allocate_particles_for_sim
@@ -81,9 +83,10 @@ type(type_element_list), target                   :: eq_element_list
 !type(type_bnd_node_list)    :: bnd_node_list !< List of boundary nodes.
 
 type(gk_neutral_state) :: neutrals
+type(gk_neutral_recycling_state) :: recycling
 
 logical :: update_electric_potential ! move to input?
-integer :: ion_group, electron_group
+integer :: ion_group, electron_group, neutral_group
 integer :: n_particles_out
 integer :: n_update_density
 integer :: n_update_temperature
@@ -135,6 +138,7 @@ n_update_poisson     = 999999 !500
 
 ion_group      = 1 ! to be derived from namelist input later
 electron_group = 2
+neutral_group  = 3
 
 !call sim%initialize(skip_group_config =.true.) 
 call sim%initialize()  
@@ -301,7 +305,8 @@ endif  ! restart_particles
   n_ions_lost_max      = size(index_lost_ions)
   n_electrons_lost_max = size(index_lost_electrons)
 
-call initialize_gk_neutrals(sim, neutrals)
+call initialize_gk_neutrals(sim, neutral_group, neutrals)
+call initialize_gk_neutral_recycling(sim, ion_group, neutral_group, recycling)
 call report_gk_neutral_diagnostics(sim, neutrals)
 
 ! q=0 neutrals are excluded from the Poisson RHS and all charged projections.
@@ -520,8 +525,6 @@ do i=1, nstep_particles
   
   project_density%rhs = 0.d0
 
-  ! Passive neutrals follow the charged advance, once per outer step (not per electron subcycle).
-  call advance_gk_neutrals(sim, neutrals, tstep_particles, nsubstep_particles)
 
   sim%time = particle_start_time + tstep_particles * nsubstep_particles
   t_now    = sim%time
@@ -555,6 +558,10 @@ do i=1, nstep_particles
                               momentum_total_lost_ions, momentum_total_lost_electrons, momentum_total_ions,    momentum_total_electrons,     &
                               potential_total_lost_ions, potential_total_lost_electrons, potential_total_ions, potential_total_electrons
 
+
+  ! Charged loss diagnostics are complete. New products first move next outer step.
+  call advance_gk_neutrals(sim, neutrals, tstep_particles, nsubstep_particles)
+  call recycle_lost_gk_ions(sim, recycling, sim%time, tstep_particles)
 
   if (sim%my_id .eq. 0) then
     call itg_energy(node_list,element_list,min(psi_start,psi_end),max(psi_start,psi_end),W_kin,W_tot)
@@ -616,6 +623,7 @@ do i=1, nstep_particles
 
   if (mod(index_now,nout).eq. 0) then
     call report_gk_neutral_diagnostics(sim, neutrals)
+    call report_gk_neutral_recycling(sim, recycling)
     call project_profiles%set_vtk_active(.true.)
     call with(sim, project_profiles)
     call project_profiles%set_vtk_active(.false.)
@@ -851,12 +859,14 @@ integer(kind=1)     :: q_b
 integer   :: i, j, k, l, m, i_elm_old, i_elm, ifail, i_coll, n_coll_ei
 integer   :: seed, i_rng, n_stream, ierr, nthreads
 integer   :: i_tor, index_lm, i_elm_temp, n_phases, n_valid_phases
-logical   :: already_lost
+logical   :: already_lost, retain_wall_metadata
 real*8    :: energy_before, energy_after
+real*8    :: lost_st(2), lost_phi
 real*8    :: va_par, va_perp, va_par_out, va_perp_out, delta_E_ab, delta_P_ab, E_ab, P_ab
 type(pcg32_rng), dimension(:), allocatable :: rng
 
 w0 = omp_get_wtime()
+retain_wall_metadata = recycling%enabled.and.i_group==ion_group
 
 if (sim%my_id .eq. 0)                                            write(*,*) sim%my_id,' particle loop, group : ',i_group
 if (i_group .eq. electron_group) then
@@ -911,13 +921,13 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
   !$omp parallel do default(none) &
 #endif
   !$omp schedule(dynamic,10)                                                     &
-  !$omp shared(sim, particles, n_steps, timesteps, particle_start_time, update,  &
+  !$omp shared(sim, particles, n_steps, timesteps, particle_start_time, update, retain_wall_metadata, &
   !$omp rho_norm, t_norm, v_norm, E_norm, M_norm, zn_norm, Tev_norm, n_phases,   &
   !$omp n_orbit, central_density, central_mass, F0, i_group, electron_group,     &
   !$omp rng, lost, n_lost, n_lost_max, ion_group,                                &
   !$omp ei_small_angle_scattering_Orb5, ei_small_angle_scattering_Lu,            &
   !$omp project_profiles, project_density)                                       &
-  !$omp private(particle_tmp, i_rng, i,j,k,l,m, t, E, B, psi, U, rz_old, st_old, &
+  !$omp private(particle_tmp, i_rng, i,j,k,l,m, t, E, B, psi, U, rz_old, st_old, lost_st, lost_phi, &
   !$omp i_elm_old, i_elm, zn0, zne0, zni0, Te_eV, Te0_eV, Ti0_eV,                &
   !$omp p_orbit, ran1, ran2,                                                     & 
   !$omp P2, P3, P6, R_g, R_s, R_t, Z_g, Z_s, Z_t, xjac, HH, HH_s, HH_t, index_lm,&
@@ -939,7 +949,13 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
     already_lost = .false.
     if (particle_tmp%i_elm .le. 0) already_lost = .true.
 
-    call push_gc_rk4(sim%fields, particle_tmp, sim%groups(i_group)%mass, timesteps, n_steps, n_orbit) ! add B, P-orbit, and U to output of push_gc_rk4
+    call push_gc_rk4(sim%fields, particle_tmp, sim%groups(i_group)%mass, timesteps, n_steps, n_orbit, &
+                     lost_st=lost_st, lost_phi=lost_phi)
+    ! Preserve the boundary metadata without changing accepted GC velocity or energy.
+    if (retain_wall_metadata.and..not.already_lost.and.particle_tmp%i_elm<0) then
+      particle_tmp%st=lost_st
+      particle_tmp%x(3)=lost_phi
+    endif
 
 !    call sim%fields%calc_EBpsiU(sim%time, particles(j)%i_elm, particles(j)%st, particles(j)%x(3), E, B, psi, U)
 
