@@ -361,6 +361,11 @@ real*8     :: JZ0 , JZ0_AR__p, JZ0_AR__n, JZ0_AR__nn, JZ0_AZ__p, JZ0_AZ__n, JZ0_
 real*8     :: Jp0 , Jp0_AR__p, Jp0_AR__n, Jp0_AR__nn, Jp0_AZ__p, Jp0_AZ__n, Jp0_AZ__nn, Jp0_A3__p, Jp0_A3__n, Jp0_A3__nn
 real*8     :: JJ2,  JJ2_AR__p, JJ2_AR__n, JJ2_AR__nn, JJ2_AZ__p, JJ2_AZ__n, JJ2_AZ__nn, JJ2_A3__p, JJ2_A3__n, JJ2_A3__nn
 
+! Toroidal particle-pressure feedback needs its own consistent linearization.
+if (.not. parallel_momentum_projection .and. use_epf) then
+  error stop 'Model 710: toroidal momentum currently requires use_epf=.false.'
+endif
+
 rho_min = 0.005 ! should be moved to namelist input
 
 ! --- Main switches
@@ -1484,6 +1489,7 @@ do i=1,n_vertex_max
             !###################################################################################################
             !#  equation 6 (Phi component momentum equation)                                                   #
             !###################################################################################################
+            if (parallel_momentum_projection) then
             Pvec_prev(var_Up) = + v * rho0_corr * BR0 * delta_g(mp,var_UR, ms,mt) &
                                 + v * rho0_corr * BZ0 * delta_g(mp,var_UZ, ms,mt) &
                                 + v * rho0_corr * BP0 * delta_g(mp,var_Up, ms,mt)
@@ -1502,6 +1508,14 @@ do i=1,n_vertex_max
                                 + BZ0 * visco_T * Qvisc_UZ__k &
                                 + Bp0 * visco_T * Qvisc_Up__k &
                                 + p0 * BgradVstar__k
+            else
+              ! Velocity formulation, consistent with the R and Z momentum equations.
+              Pvec_prev(var_Up) = v * rho0_corr * delta_g(mp,var_Up,ms,mt)
+              Qvec_p(var_Up) = Qconv_Up + JxB_Up__p + visco_T * Qvisc_Up__p &
+                               - v * particle_source(ms,mt) * Up0         &
+                               - visco_num * lap_Vstar * lap_Up
+              Qvec_k(var_Up) = v_p/R * p0 + JxB_Up__k + visco_T * Qvisc_Up__k
+            endif
             
             !###################################################################################################
             !#  equation 7 (Density equation)                                                                  #
@@ -1557,18 +1571,28 @@ do i=1,n_vertex_max
               VMS__p(var_Up)   = rho0 * ( CvGradUp0 * CvGradVi__p + VbGradUp0 * VbGradVi__p )
               Qvec_p(var_UR)   = Qvec_p(var_UR) - TG_NUM_Eq*TG_NUM(var_UR) * CoefAdv * VMS__p(var_UR)
               Qvec_p(var_UZ)   = Qvec_p(var_UZ) - TG_NUM_Eq*TG_NUM(var_UZ) * CoefAdv * VMS__p(var_UZ)
+              if (parallel_momentum_projection) then
               Qvec_p(var_Up) = Qvec_p(var_Up) - TG_NUM_Eq * TG_NUM(var_Up) * CoefAdv * (  BR0*VMS__p(var_UR) &
                                                                                         + BZ0*VMS__p(var_UZ) &
                                                                                         + Bp0*VMS__p(var_Up) )
+              else
+                Qvec_p(var_Up) = Qvec_p(var_Up) &
+                  - TG_NUM_Eq * TG_NUM(var_Up) * CoefAdv * VMS__p(var_Up)
+              endif
              
               VMS__k(var_UR)   = rho0 * ( CvGradUR0 * CvGradVi__k + VbGradUR0 * VbGradVi__k )
               VMS__k(var_UZ)   = rho0 * ( CvGradUZ0 * CvGradVi__k + VbGradUZ0 * VbGradVi__k )
               VMS__k(var_Up)   = rho0 * ( CvGradUp0 * CvGradVi__k + VbGradUp0 * VbGradVi__k )
               Qvec_k(var_UR)   = Qvec_k(var_UR) - TG_NUM_Eq*TG_NUM(var_UR) * CoefAdv * VMS__k(var_UR)
               Qvec_k(var_UZ)   = Qvec_k(var_UZ) - TG_NUM_Eq*TG_NUM(var_UZ) * CoefAdv * VMS__k(var_UZ)
+              if (parallel_momentum_projection) then
               Qvec_k(var_Up) = Qvec_k(var_Up) - TG_NUM_Eq * TG_NUM(var_Up) * CoefAdv * (  BR0*VMS__k(var_UR) &
                                                                                         + BZ0*VMS__k(var_UZ) &
                                                                                         + Bp0*VMS__k(var_Up) )
+              else
+                Qvec_k(var_Up) = Qvec_k(var_Up) &
+                  - TG_NUM_Eq * TG_NUM(var_Up) * CoefAdv * VMS__k(var_Up)
+              endif
              
               VMS__p(var_rho) =         CvGradr0 * CvGradVi__p + VbGradr0 * VbGradVi__p
               VMS__p(var_T)   = rho0 *( CvGradT0 * CvGradVi__p + VbGradT0 * VbGradVi__p )
@@ -1589,8 +1613,12 @@ do i=1,n_vertex_max
             !###################################################################################################
             Qvec_p(var_UR) = Qvec_p(var_UR) - visco_divV * divU * ( v_R + v / R )
             Qvec_p(var_UZ) = Qvec_p(var_UZ) - visco_divV * divU * v_Z 
+            if (parallel_momentum_projection) then
             Qvec_p(var_Up) = Qvec_p(var_Up) - visco_divV * divU * BgradVstar__p
             Qvec_k(var_Up) = Qvec_k(var_Up) - visco_divV * divU * BgradVstar__k
+            else
+              Qvec_k(var_Up) = Qvec_k(var_Up) - visco_divV * divU * v_p/R
+            endif
 
 
 
@@ -2626,6 +2654,7 @@ do i=1,n_vertex_max
                   !###################################################################################################
                   !#  equation 6   (Phi component momentum equation)                                                 #
                   !###################################################################################################
+                  if (parallel_momentum_projection) then
                   Pjac(var_Up,var_UR)    = v * BR0 * rho0_corr * UR
                   Pjac(var_Up,var_UZ)    = v * BZ0 * rho0_corr * UZ
                   Pjac(var_Up,var_Up)    = v * Bp0 * rho0_corr * Up 
@@ -2797,6 +2826,50 @@ do i=1,n_vertex_max
                                             + BZ0 * dvisco_dT * T * Qvisc_UZ__k &
                                             + Bp0 * dvisco_dT * T * Qvisc_Up__k &
                                             + (rho0*T) * BgradVstar__k
+                  else
+                    ! Frozen-density velocity mass, as in equations 4 and 5.
+                    Pjac(var_Up,var_Up) = v * rho0_corr * Up
+
+                    Qjac_p(var_Up,var_AR) = Qconv_Up_AR__p + JxB_Up_AR__p
+                    Qjac_n(var_Up,var_AR) = Qconv_Up_AR__n + JxB_Up_AR__n
+                    Qjac_k(var_Up,var_AR) = JxB_Up_AR__k
+                    Qjac_kn(var_Up,var_AR) = JxB_Up_AR__kn
+
+                    Qjac_p(var_Up,var_AZ) = Qconv_Up_AZ__p + JxB_Up_AZ__p
+                    Qjac_n(var_Up,var_AZ) = Qconv_Up_AZ__n + JxB_Up_AZ__n
+                    Qjac_k(var_Up,var_AZ) = JxB_Up_AZ__k
+                    Qjac_kn(var_Up,var_AZ) = JxB_Up_AZ__kn
+
+                    Qjac_p(var_Up,var_A3) = Qconv_Up_A3__p + JxB_Up_A3__p
+                    Qjac_n(var_Up,var_A3) = Qconv_Up_A3__n + JxB_Up_A3__n
+                    Qjac_k(var_Up,var_A3) = JxB_Up_A3__k
+                    Qjac_kn(var_Up,var_A3) = JxB_Up_A3__kn
+
+                    Qjac_p(var_Up,var_UR) = Qconv_Up_UR__p + visco_T * Qvisc_Up_UR__p
+                    Qjac_n(var_Up,var_UR) = Qconv_Up_UR__n + visco_T * Qvisc_Up_UR__n
+                    Qjac_k(var_Up,var_UR) = visco_T * Qvisc_Up_UR__k
+                    Qjac_kn(var_Up,var_UR) = visco_T * Qvisc_Up_UR__kn
+
+                    Qjac_p(var_Up,var_UZ) = Qconv_Up_UZ__p + visco_T * Qvisc_Up_UZ__p
+                    Qjac_n(var_Up,var_UZ) = Qconv_Up_UZ__n + visco_T * Qvisc_Up_UZ__n
+                    Qjac_k(var_Up,var_UZ) = visco_T * Qvisc_Up_UZ__k
+                    Qjac_kn(var_Up,var_UZ) = visco_T * Qvisc_Up_UZ__kn
+
+                    Qjac_p(var_Up,var_Up) = Qconv_Up_Up__p + visco_T * Qvisc_Up_Up__p &
+                      - v * particle_source(ms,mt) * Up - visco_num * lap_Vstar * lap_bf
+                    Qjac_n(var_Up,var_Up) = Qconv_Up_Up__n + visco_T * Qvisc_Up_Up__n
+                    Qjac_k(var_Up,var_Up) = visco_T * Qvisc_Up_Up__k
+                    Qjac_kn(var_Up,var_Up) = visco_T * Qvisc_Up_Up__kn
+
+                    Qjac_p(var_Up,var_rho) = Qconv_Up_rho__p
+                    Qjac_n(var_Up,var_rho) = Qconv_Up_rho__n
+                    Qjac_k(var_Up,var_rho) = v_p/R * (rho*T0)
+
+                    Qjac_p(var_Up,var_T) = Qconv_Up_T__p + dvisco_dT * T * Qvisc_Up__p
+                    Qjac_n(var_Up,var_T) = Qconv_Up_T__n
+                    Qjac_k(var_Up,var_T) = v_p/R * (rho0*T) + dvisco_dT * T * Qvisc_Up__k
+                    ! Qjac_pnn(var_Up,:) remains zero: toroidal diffusion is in Qjac_kn.
+                  endif
 
                   !###################################################################################################
                   !#  equation 7   (Density equation)                                                                #
@@ -3140,6 +3213,7 @@ do i=1,n_vertex_max
                      Qjac_k (var_UZ,:) = Qjac_k (var_UZ,:) - TG_NUM(var_UZ) * (CoefAdv * QvmsAd_k (var_UZ,:) + QvmsF_k (var_UZ,:) )
                      Qjac_kn(var_UZ,:) = Qjac_kn(var_UZ,:) - TG_NUM(var_UZ) * (CoefAdv * QvmsAd_kn(var_UZ,:) + QvmsF_kn(var_UZ,:) )
 
+                     if (parallel_momentum_projection) then
                      Qjac_p (var_Up, :) = Qjac_p (var_Up, :) - TG_NUM(var_Up) * (  BR0 *( CoefAdv * QvmsAd_p (var_UR,:) + QvmsF_p (var_UR, :) ) &
                                                                                  + BZ0 *( CoefAdv * QvmsAd_p (var_UZ,:) + QvmsF_p (var_UZ, :) ) &
                                                                                  + Bp0 *( CoefAdv * QvmsAd_p (var_Up,:) + QvmsF_p (var_Up, :) ) )
@@ -3152,6 +3226,12 @@ do i=1,n_vertex_max
                      Qjac_kn(var_Up, :) = Qjac_kn(var_Up, :) - TG_NUM(var_Up) * (  BR0 *( CoefAdv * QvmsAd_kn(var_UR,:) + QvmsF_kn(var_UR, :) ) &
                                                                                  + BZ0 *( CoefAdv * QvmsAd_kn(var_UZ,:) + QvmsF_kn(var_UZ, :) ) &
                                                                                  + Bp0 *( CoefAdv * QvmsAd_kn(var_Up,:) + QvmsF_kn(var_Up, :) ) )
+                     else
+                       Qjac_p(var_Up,:) = Qjac_p(var_Up,:) - TG_NUM(var_Up) * (CoefAdv * QvmsAd_p(var_Up,:) + QvmsF_p(var_Up,:))
+                       Qjac_n(var_Up,:) = Qjac_n(var_Up,:) - TG_NUM(var_Up) * (CoefAdv * QvmsAd_n(var_Up,:) + QvmsF_n(var_Up,:))
+                       Qjac_k(var_Up,:) = Qjac_k(var_Up,:) - TG_NUM(var_Up) * (CoefAdv * QvmsAd_k(var_Up,:) + QvmsF_k(var_Up,:))
+                       Qjac_kn(var_Up,:) = Qjac_kn(var_Up,:) - TG_NUM(var_Up) * (CoefAdv * QvmsAd_kn(var_Up,:) + QvmsF_kn(var_Up,:))
+                     endif
 
                      Qjac_p (var_rho, :) = Qjac_p (var_rho, :) - TG_NUM(var_rho ) *  CoefAdv * QvmsAd_p (var_rho, :) 
                      Qjac_n (var_rho, :) = Qjac_n (var_rho, :) - TG_NUM(var_rho ) *  CoefAdv * QvmsAd_n (var_rho, :) 
@@ -3187,6 +3267,7 @@ do i=1,n_vertex_max
                      Qjac_k (var_UZ, :)   = Qjac_k (var_UZ, :) - TG_NUM(var_UZ) * QvmsF_k (var_UZ, :)
                      Qjac_kn(var_UZ, :)   = Qjac_kn(var_UZ, :) - TG_NUM(var_UZ) * QvmsF_kn(var_UZ, :)
 
+                     if (parallel_momentum_projection) then
                      Qjac_p (var_Up, :) = Qjac_p (var_Up, :) - TG_NUM(var_Up) *  (  BR0 *( QvmsF_p (var_UR, :) ) &
                                                                                   + BZ0 *( QvmsF_p (var_UZ, :) ) &
                                                                                   + Bp0 *( QvmsF_p (var_Up, :) ) )
@@ -3199,6 +3280,12 @@ do i=1,n_vertex_max
                      Qjac_kn(var_Up, :) = Qjac_kn(var_Up, :) - TG_NUM(var_Up) *  (  BR0 *( QvmsF_kn(var_UR, :) ) &
                                                                                   + BZ0 *( QvmsF_kn(var_UZ, :) ) &
                                                                                   + Bp0 *( QvmsF_kn(var_Up, :) ) )
+                     else
+                       Qjac_p(var_Up,:) = Qjac_p(var_Up,:) - TG_NUM(var_Up) * QvmsF_p(var_Up,:)
+                       Qjac_n(var_Up,:) = Qjac_n(var_Up,:) - TG_NUM(var_Up) * QvmsF_n(var_Up,:)
+                       Qjac_k(var_Up,:) = Qjac_k(var_Up,:) - TG_NUM(var_Up) * QvmsF_k(var_Up,:)
+                       Qjac_kn(var_Up,:) = Qjac_kn(var_Up,:) - TG_NUM(var_Up) * QvmsF_kn(var_Up,:)
+                     endif
                   CASE(-1)
                      ! --- no VMS
                   END SELECT
@@ -3217,6 +3304,7 @@ do i=1,n_vertex_max
                   Qjac_n (var_UZ,var_Up) = Qjac_n (var_UZ,var_Up) -  visco_divV * divU_Up__n  * v_Z 
                   Qjac_p (var_UZ,var_T ) = Qjac_p (var_UZ,var_T ) - dvisco_divV_dT * T * divU * v_Z
 
+                  if (parallel_momentum_projection) then
                   Qjac_p (var_Up,var_AR) = Qjac_p (var_Up,var_AR) - visco_divV * divU    * BgradVstar_AR__p
                   Qjac_n (var_Up,var_AR) = Qjac_n (var_Up,var_AR) - visco_divV * divU    * BgradVstar_AR__n
                   Qjac_k (var_Up,var_AR) = Qjac_k (var_Up,var_AR) - visco_divV * divU    * BgradVstar_AR__k
@@ -3236,6 +3324,12 @@ do i=1,n_vertex_max
                   Qjac_kn(var_Up,var_Up) = Qjac_kn(var_Up,var_Up) -  visco_divV * divU_Up__n  * BgradVstar__k
                   Qjac_p (var_Up,var_T ) = Qjac_p (var_Up,var_T ) - dvisco_divV_dT * T * divU * BgradVstar__p
                   Qjac_k (var_Up,var_T ) = Qjac_k (var_Up,var_T ) - dvisco_divV_dT * T * divU * BgradVstar__k
+                  else
+                    Qjac_k(var_Up,var_UR) = Qjac_k(var_Up,var_UR) - visco_divV * divU_UR * v_p/R
+                    Qjac_k(var_Up,var_UZ) = Qjac_k(var_Up,var_UZ) - visco_divV * divU_UZ * v_p/R
+                    Qjac_kn(var_Up,var_Up) = Qjac_kn(var_Up,var_Up) - visco_divV * divU_Up__n * v_p/R
+                    Qjac_k(var_Up,var_T) = Qjac_k(var_Up,var_T) - dvisco_divV_dT * T * divU * v_p/R
+                  endif
 
                   if (use_fft) then
                     index_kl =       n_var*n_degrees*(k-1) +       n_var*(l-1) + 1
@@ -3573,7 +3667,7 @@ enddo ! i loop (n_vertex)
 if (n_tor > n_tor_fft_thresh) ELM = 0.5d0 * ELM
 
 ! Temporary FRC test: penalize changes in toroidal velocity for every assembled component.
-if (F0 == 0.d0) then
+if (parallel_momentum_projection .and. F0 == 0.d0) then
   ncomp = i_tor_max - i_tor_min + 1
   do i = 1, n_vertex_max
     do j = 1, n_degrees

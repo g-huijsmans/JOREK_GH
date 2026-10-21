@@ -689,6 +689,7 @@ subroutine preset_parameters
   equil              = .true.               ! compute equilibrium
   
   no_mach1_bc        = .false.              ! Never apply Mach-1 BCs
+  parallel_momentum_projection = .true.    ! Model 710: retain the B-parallel momentum equation by default
 
   Mach1_openBC       = .true.               ! Full-MHD: Apply Mach-1 BCs inside mod_boundary_matrix_open.f90 (or mod_boundary_conditions.f90)
   Mach1_fix_B        = .true.               !< Full-MHD: Use the initial magnetic field for Mach1 BCs on targets, ie. without AR and AZ variations

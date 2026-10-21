@@ -21,6 +21,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 restart, regrid, write_ps, time_evol_theta,         &
                 regrid_from_rz, force_horizontal_Xline,             &
                 time_evol_zeta,                                     &
+                parallel_momentum_projection,                      &
                 Mach1_openBC, Mach1_fix_B,                          &
                 eta_ARAZ_const, eta_ARAZ_on, eta_ARAZ_simple,       &
                 tauIC_ARAZ_on,                                      &

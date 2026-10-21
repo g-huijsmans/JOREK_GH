@@ -97,6 +97,7 @@ module phys_module
   logical :: adaptive_time        !< (presently not useful)
   logical :: equil                !< compute equilibrium
   logical :: no_mach1_bc          !< Never apply Mach-1 BCs
+  logical :: parallel_momentum_projection !< Model 710: B-parallel (.true.) or toroidal (.false.) momentum equation
   logical :: Mach1_openBC         !< Full-MHD: Apply Mach-1 BCs inside mod_boundary_matrix_open.f90 (or mod_boundary_conditions.f90)
   logical :: Mach1_fix_B          !< Full-MHD: Use the initial magnetic field for Mach1 BCs on targets, ie. without AR and AZ variations
   logical :: export_polar_boundary !< Option to export boundary.txt even in the case of a polar boundary.

@@ -874,6 +874,7 @@ write(*,'(1x,a)',advance='no') ' USE_DOMM            : '
   write(*,LOGI_FMT) 'strumpack_matching    ', strumpack_matching
 
 #ifdef fullmhd
+    if (jorek_model == 710) write(*,LOGI_FMT) 'parallel_momentum_projection', parallel_momentum_projection
     write(*,LOGI_FMT) 'Mach1_openBC          ', Mach1_openBC
     write(*,LOGI_FMT) 'Mach1_fix_B           ', Mach1_fix_B
     write(*,REA3_FMT) 'eta_ARAZ_const        ', eta_ARAZ_const

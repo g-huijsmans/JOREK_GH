@@ -263,6 +263,9 @@ do i=1, n_local_elms !=== do elements
           .or. (node_list%node(inode)%boundary .eq. 12) &
       ) then
         apply_dirichlet_all = .true.
+
+        if (R_mid .le. 0.d0) cycle
+        
       endif
 
       ! --- Mach1 for normal nodes?
