@@ -42,7 +42,11 @@ module mod_plasma_functions
 
       ZK_par_SpitzerHaerm   = 5.5789d+0 * central_mass*ATOMIC_MASS_UNIT/(mass_electron*lnA_center) * Te0_keV**(2.5d+0) * (gamma-1.d0) * sqrt_mu0_over_rho0
     end if
-    tauIC_nominal      = central_mass * ATOMIC_MASS_UNIT / ( EL_CHG * F0 * sqrt_mu0_rho0 * 2.d0 )
+    if (abs(F0) > tiny(F0)) then
+      tauIC_nominal = central_mass * ATOMIC_MASS_UNIT / (EL_CHG * F0 * sqrt_mu0_rho0 * 2.d0)
+    else
+      tauIC_nominal = 0.d0
+    endif
     eta_Spitzer        = ( 1.65d-9 * lnA_center * Te0_keV**(-1.5d+0) ) / sqrt_mu0_over_rho0
 
     ! --- Assign minimum values for parallel conduction if not given

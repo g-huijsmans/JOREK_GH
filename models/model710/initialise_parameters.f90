@@ -107,7 +107,7 @@ namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
                 FB_Zaxis_derivative,FB_Zaxis_integral, start_VFB,   &
                 n_feedback_current, n_feedback_vertical,            &
                 n_iter_freeb, n_pf_coils, pf_coils, R_axis_ref,     &
-                axis_srch_radius,                                   &
+                axis_srch_radius, rect_grid_vac_psi,                &
                 starwall_equil_coils, freeb_equil_iterate_area,     &
                 psi_offset_freeb, diag_coils, rmp_coils,            &
                 voltage_coils, vert_FB_amp, find_pf_coil_currents,  &

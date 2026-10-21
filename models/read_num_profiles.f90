@@ -9,6 +9,7 @@ subroutine read_num_profiles(my_id)
   
   integer, intent(in) :: my_id
   integer             :: i
+  logical             :: zero_F_profile
   
   num_rho = ( rho_file /= 'none' )
   if ( num_rho .and. ( my_id == 0 ) ) then
@@ -61,6 +62,10 @@ subroutine read_num_profiles(my_id)
   end if
   
   num_ffprime = ( ffprime_file /= 'none' )
+
+  zero_F_profile = F0 == 0.d0 .and. FF_0 == 0.d0 .and. FF_1 == 0.d0 .and. &
+                 FF_coef(6) == 0.d0 .and. (.not. num_ffprime)
+
   if ( num_ffprime .and. ( my_id == 0 ) ) then
     call readProf(num_ffprime_x, num_ffprime_y0, num_ffprime_len, ffprime_file)
     call check_num_prof(num_ffprime, num_ffprime_x, num_ffprime_y0, num_ffprime_len, 'ffprime',    &
@@ -93,7 +98,12 @@ subroutine read_num_profiles(my_id)
   if (my_id == 0) then
     if ( .not. num_Fprofile ) then
       ! --- Numerical integration of FFprime
-      call integrate_F_profile()
+!      call integrate_F_profile()
+      if (zero_F_profile) then
+        Fprofile_internal = 0.d0
+      else
+        call integrate_F_profile()
+      endif
       ! --- Copy profile from internal profile instead of reading it from file
       num_Fprofile_len = n_Fprofile_internal
       if ( allocated(num_Fprofile_x ) ) deallocate( num_Fprofile_x  )
@@ -114,7 +124,7 @@ subroutine read_num_profiles(my_id)
       call derivProf(num_Fprofile_x, num_Fprofile_y1, num_Fprofile_len, num_Fprofile_y2)
       call derivProf(num_Fprofile_x, num_Fprofile_y2, num_Fprofile_len, num_Fprofile_y3)
       ! --- Check that new profile is accurate by deriving again and comparing against input FFprime
-      call check_F_profile_accuracy() ! this will abort if error is too large
+      if (.not. zero_F_profile) call check_F_profile_accuracy() ! this will abort if error is too large
     else
       call readProf(num_Fprofile_x, num_Fprofile_y0, num_Fprofile_len, Fprofile_file)
       call check_num_prof(num_Fprofile, num_Fprofile_x, num_Fprofile_y0, num_Fprofile_len, 'Fprofile',    &

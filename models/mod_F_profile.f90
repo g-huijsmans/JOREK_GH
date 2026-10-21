@@ -44,6 +44,29 @@ subroutine F_profile(xpoint2,xcase2,Z,Z_xpoint,psi,psi_axis,psi_bnd,&
   ! --- Just to save the analytical formulation, just in case, never know...
   logical, parameter :: force_analytical = .false.
 
+
+! Special case for purely poloidal equilibrium (FRC)
+  if (F0 == 0.d0 .and. FF_0 == 0.d0 .and. &
+    FF_1 == 0.d0 .and. FF_coef(6) == 0.d0 .and. &
+    (.not. num_ffprime)) then
+
+    F_prof       = 0.d0
+    dF_dpsi      = 0.d0
+    dF_dz        = 0.d0
+    dF_dpsi2     = 0.d0
+    dF_dz2       = 0.d0
+    dF_dpsi_dz   = 0.d0
+
+    FFprime_prof = 0.d0
+    dFF_dpsi     = 0.d0
+    dFF_dz       = 0.d0
+    dFF_dpsi2    = 0.d0
+    dFF_dz2      = 0.d0
+    dFF_dpsi_dz  = 0.d0
+
+    return
+  endif
+
   ! --- psi_norm
   psi_n = (psi - psi_axis)/(psi_bnd - psi_axis)
   delta_psi = (psi_bnd - psi_axis)

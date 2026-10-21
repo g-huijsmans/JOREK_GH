@@ -53,7 +53,7 @@ real*8, dimension(n_plane,n_var,n_gauss,n_gauss), intent(inout) :: delta_g, delt
 real*8, dimension(n_plane,n_var,n_gauss,n_gauss) :: eq_aux_g, eq_aux_s, eq_aux_t, eq_aux_p
 
 ! --- Variables outside the OMP loop
-integer    :: n_tor_start, n_tor_end, n_tor_local
+integer    :: n_tor_start, n_tor_end, n_tor_local, ncomp, i_penalty_comp
 integer    :: i, j, index, index_k, index_m, i_v, j_loc, i_loc, m, ik
 integer    :: in, im, ivar, kvar, ms, mt, mp
 real*8     :: wst, xjac, xjac_R, xjac_Z, R, Z, theta, zeta
@@ -3569,9 +3569,23 @@ do i=1,n_vertex_max
   enddo ! j loop n_degrees
 enddo ! i loop (n_vertex)
 
-if (n_tor .le. n_tor_fft_thresh) return
+! Normalize before adding the temporary penalty; retain the existing condition.
+if (n_tor > n_tor_fft_thresh) ELM = 0.5d0 * ELM
 
-ELM = 0.5d0 * ELM
+! Temporary FRC test: penalize changes in toroidal velocity for every assembled component.
+if (F0 == 0.d0) then
+  ncomp = i_tor_max - i_tor_min + 1
+  do i = 1, n_vertex_max
+    do j = 1, n_degrees
+      do i_penalty_comp = 1, ncomp
+        index = ncomp * (n_var*(n_degrees*(i-1) + j-1) + var_Up-1) + i_penalty_comp
+        ELM(index,index) = ELM(index,index) + 1.d12
+      enddo
+    enddo
+  enddo
+endif
+
+if (n_tor .le. n_tor_fft_thresh) return
 
 do j=1, n_vertex_max*n_var*n_degrees
 

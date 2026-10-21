@@ -592,6 +592,14 @@ if (my_id == 0) then
   endif
 #endif
   ! --- END of filling data for current variable "zj" (R-MHD only)
+
+  ! --- Temporary FRC equilibrium-only test
+  if (nstep == 0 .and. F0 == 0.d0 .and. .not. freeboundary_equil) then
+    write(*,*) 'FRC: skipping tokamak flux-surface postprocessing'
+    equil_initialized = .true.
+    return
+  endif
+
   
   ! --- Find flux surfaces and plot them; determine the q-profile.  
   if (xpoint2 .and. (n_flux .gt. 1)) then

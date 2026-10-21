@@ -884,7 +884,7 @@ write(*,*) "n elements:", element_list%n_elements
     endif   !--- my_id=0
 
 #if (!defined STELLARATOR_MODEL) || (!defined USE_DOMM)
-    call int3d_new(my_id, mhd_sim%node_list, mhd_sim%element_list, bnd_node_list, bnd_elm_list, exprs_all_int, res, 1)
+!    call int3d_new(my_id, mhd_sim%node_list, mhd_sim%element_list, bnd_node_list, bnd_elm_list, exprs_all_int, res, 1)
 #endif
 
     if (my_id .eq. 0 ) then
