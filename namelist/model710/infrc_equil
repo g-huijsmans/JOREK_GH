@@ -4,14 +4,19 @@
  equil   = .t.
  restart = .f.
 
- tstep = .2 
+ tstep = 1.0 
  nstep = 0
  
  nout = 10
 
+ time_evol_scheme = 'Gears'
+ 
+ use_mumps_eq = .true.
+ use_strumpack_eq = .false.
  use_mumps = .f.
  use_strumpack=.t.
 
+ bc_natural_open = .false.
  no_mach1_bc     = .t.
  Mach1_openBC    = .f.
  bc_natural_open = .f.
@@ -19,6 +24,14 @@
  parallel_momentum_projection = .false.   ! false for FRC cases
 
  keep_current_prof = .false.
+
+
+ gmres = .true.
+ gmres_4     = 1.d0
+ iter_precon = 11
+ gmres_tol   = 1.d-9
+ gmres_m     = 20
+ gmres_max_iter = 500
 
 ! bcs(:)%mach1           = .f.
 ! bcs(:)%natural%rho     = .f.
@@ -29,20 +42,24 @@
 ! bcs(:)%natural%rhon    = .f.
 
 
- R_geo    = 0.5
+ R_geo    = 0.608
  Z_geo    = 0.0
  R_begin  = 0.0
  R_end    = 1.0
  Z_begin  = -1.5
  Z_end    = 1.5
 
- axis_srch_radius = 0.5
+ axis_srch_radius = 0.2
+ n_limiter = 1
+ R_limiter(1) = 0.d0
+ Z_limiter(1) = 0.d0
+
  amix = 0.2
 
  F0       = 0.0
  
- n_R       = 100
- n_Z       = 100
+ n_R       = 200
+ n_Z       = 200
  n_radial  = 0
  n_pol     = 0
  n_flux    = 0
@@ -64,7 +81,7 @@ n_flux = 0
 
 ! External axial field
 rect_grid_vac_psi = -1.5d-2
-!psi_axis_init = 0.0128
+psi_axis_init = 0.0128
 
 ! Start with a pressure gradient
 rho_0 = 1.d0
@@ -79,11 +96,15 @@ T_coef(2) = +1.d0
 T_coef(3) = 0.d0
 T_coef(4) = 0.1d0
 T_coef(5) = 1.0d0
-
 											    
  eta            = 1.d-5
  visco          = 1.d-5
  visco_par      = 1.d-5
+
+ eta_T_dependent   = .true.
+ visco_T_dependent = .true.
+ ZKpar_T_dependent = .false.
+
 
  D_par          = 0.d0
  D_perp(1)      = 1.d-6
@@ -99,10 +120,10 @@ T_coef(5) = 1.0d0
  ZK_perp(4)     = 1.d-2
  ZK_perp(5)     = 1.d+3
 
- eta_num        = 1.d-14
- visco_num      = 1.d-14
- D_perp_num     = 1.d-14
- ZK_perp_num    = 1.d-14
+ eta_num        = 0.d-12
+ visco_num      = 0.d-12
+ D_perp_num     = 0.d-12
+ ZK_perp_num    = 0.d-12
 
  heatsource     = 0.d0
  particlesource = 0.d0

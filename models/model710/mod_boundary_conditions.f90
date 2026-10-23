@@ -28,7 +28,7 @@ subroutine boundary_conditions( my_id, node_list, element_list, bnd_node_list, l
                                 xcase2, R_axis, Z_axis, psi_axis, psi_bnd,                &
                                 R_xpoint, Z_xpoint, psi_xpoint, a_mat)
 
-use mod_assembly, only : boundary_conditions_add_one_entry, boundary_conditions_add_RHS
+use mod_assembly, only : boundary_conditions_add_one_entry, boundary_conditions_add_RHS, boundary_conditions_zero_dofs
 use data_structure
 use vacuum, ONLY: is_freebound
 use phys_module, only: F0, GAMMA, freeboundary, RMP_on, psi_RMP_cos, dpsi_RMP_cos_dR, dpsi_RMP_cos_dZ, &
@@ -121,6 +121,9 @@ integer :: ilarge_vsvs, ilarge_vsTs, ilarge_vsT, ilarge_vut, ilarge_vtvt, ilarge
 integer :: ilarge_vp, ilarge_vp2
 integer :: ierr
 logical :: apply_psi_BC, apply_current_BC, s_constant_boundary, t_constant_boundary, apply_cs, apply_dirichlet_all
+logical :: axis_regular_node
+logical, allocatable :: magnetic_axis_dof(:)
+real*8, allocatable :: magnetic_axis_value(:)
 
 real*8  :: factor, factor_b
 real*8  :: c_1, c_2, c_3
@@ -215,6 +218,10 @@ do i=1, n_local_elms !=== do elements
 
     if (node_list%node(inode)%boundary .eq. 0) cycle 
 
+    axis_regular_node = (abs(node_list%node(inode)%x(1,1,1)) .le. 1.d-6) .and. &
+                   ((node_list%node(inode)%boundary .eq. 2) .or. &
+                    (node_list%node(inode)%boundary .eq. 3))
+
     do idir=1, 2        ! check the two directions
 
       R_mid = node_list%node(inode)%x(1,1,1)
@@ -261,12 +268,21 @@ do i=1, n_local_elms !=== do elements
       if (                                              &
                (node_list%node(inode)%boundary .eq.  2) &
           .or. (node_list%node(inode)%boundary .eq. 12) &
-      ) then
-        apply_dirichlet_all = .true.
+        ) then
 
-        if (R_mid .le. 0.d0) cycle
+          apply_dirichlet_all = .true.
+
+        endif
+
+      if ( s_constant_boundary .and.                     &
+               ((node_list%node(inode)%boundary .eq. 2)  &
+          .or.  (node_list%node(inode)%boundary .eq. 3)) &
+         ) then
+
+        if (R_mid .le. 1.d-6) cycle
         
       endif
+
 
       ! --- Mach1 for normal nodes?
       if (                                              &
@@ -358,6 +374,10 @@ do i=1, n_local_elms !=== do elements
 
  
         do k=1, n_var ! === do variables
+          ! The n=0 A3 corner rows are supplied exactly once by the axis block.
+          if (k == var_A3 .and. in == 1) then
+            if (magnetic_axis_node(node_list%node(inode))) cycle
+          endif
                                                                                                  
           ! --- Decide when A3,AR,AZ need BCs
           apply_psi_BC = .false.
@@ -388,6 +408,10 @@ do i=1, n_local_elms !=== do elements
               do ll = 1,(n_order+1)/2
                 if ( (iv_dir .eq. 2) .and. (ll .gt. 1) ) cycle ! do only s-derivatives and node value
                 index_tmp = node_indices(kk,ll)
+                ! --- The n=0 density radial derivative is set by axis regularity below.
+                if (axis_regular_node .and. (k .eq. var_rho) .and. (in .eq. 1) .and. (index_tmp .eq. 2)) cycle
+                ! --- The n=0 radial velocity value is set by axis regularity below.
+                if (axis_regular_node .and. (k .eq. var_UR) .and. (in .eq. 1) .and. (index_tmp .eq. 1)) cycle
                 index_node = node_list%node(inode)%index(index_tmp)
                 call boundary_conditions_add_one_entry(                 &
                        index_node, k, in, index_node, k, in,            &
@@ -401,10 +425,15 @@ do i=1, n_local_elms !=== do elements
               call boundary_conditions_add_one_entry(                 &
                      index_node, k, in, index_node, k, in,            &
                      zbig, index_min, index_max, a_mat)
-              index_node = node_list%node(inode)%index(4)
-              call boundary_conditions_add_one_entry(                 &
-                     index_node, k, in, index_node, k, in,            &
-                     zbig, index_min, index_max, a_mat)
+              ! --- Leave A3_st free at R=0 corners on the Z boundaries.
+              if (.not. (t_constant_boundary .and.                      &
+                         (node_list%node(inode)%boundary .eq. 3) .and. &
+                         (abs(R_mid) .le. 1.d-6))) then
+                index_node = node_list%node(inode)%index(4)
+                call boundary_conditions_add_one_entry(                 &
+                       index_node, k, in, index_node, k, in,            &
+                       zbig, index_min, index_max, a_mat)
+              endif
             endif
 
           endif ! --- apply Dirichlet
@@ -999,6 +1028,59 @@ do i=1, n_local_elms !=== do elements
  
 enddo           !=== do elements
 
+! --- Apply n=0 regularity once per owned R=0 DOF, including the corners.
+! --- The solve updates values by +delta, so enforce delta = -current coefficient.
+! --- Density remains even in R: rho_R = rho_RZ = 0 (existing constraints).
+if ((a_mat%i_tor_min .le. 1) .and. (a_mat%i_tor_max .ge. 1)) then
+  do inode=1, node_list%n_nodes
+    axis_regular_node = (abs(node_list%node(inode)%x(1,1,1)) .le. 1.d-6) .and. &
+                   ((node_list%node(inode)%boundary .eq. 2) .or. &
+                    (node_list%node(inode)%boundary .eq. 3))
+    if (.not. axis_regular_node) cycle
+    ! --- A regular n=0 radial velocity is odd in R: U_R = U_R,Z = 0.
+    ! --- On this rectangular grid these are DOFs 1 and 3; radial DOFs stay free
+    ! --- of this constraint. Existing Z-boundary radial-derivative penalties remain.
+    do j=1,3,2
+      index_node = node_list%node(inode)%index(j)
+      call boundary_conditions_add_one_entry( &
+             index_node, var_UR, 1, index_node, var_UR, 1, &
+             zbig_backup, index_min, index_max, a_mat)
+      call boundary_conditions_add_RHS( &
+             index_node, var_UR, 1, index_min, index_max, RHS_loc, &
+             -zbig_backup * node_list%node(inode)%values(1,j,var_UR), a_mat%i_tor_min, a_mat%i_tor_max)
+    enddo
+    do j=2,4,2
+      index_node = node_list%node(inode)%index(j)
+      call boundary_conditions_add_one_entry( &
+             index_node, var_rho, 1, index_node, var_rho, 1, &
+             zbig_backup, index_min, index_max, a_mat)
+      call boundary_conditions_add_RHS( &
+             index_node, var_rho, 1, index_min, index_max, RHS_loc, &
+             -zbig_backup * node_list%node(inode)%values(1,j,var_rho), a_mat%i_tor_min, a_mat%i_tor_max)
+    enddo
+  enddo
+endif
+
+! Exact n=0 magnetic regularity. Do not constrain A3_RR (and hence BZ).
+! Eliminate the known correction -A3 from both the product and PC matrices;
+! unlike a large diagonal alone this leaves no physical coupling in the rows.
+if (a_mat%i_tor_min <= 1 .and. a_mat%i_tor_max >= 1) then
+  allocate(magnetic_axis_dof(a_mat%ng/(n_var*(a_mat%i_tor_max-a_mat%i_tor_min+1))))
+  allocate(magnetic_axis_value(size(magnetic_axis_dof)))
+  magnetic_axis_dof = .false.
+  magnetic_axis_value = 0.d0
+  do inode=1,node_list%n_nodes
+    if (.not. magnetic_axis_node(node_list%node(inode))) cycle
+    do j=1,4
+      index_node = node_list%node(inode)%index(j)
+      magnetic_axis_dof(index_node) = .true.
+      magnetic_axis_value(index_node) = node_list%node(inode)%values(1,j,var_A3)
+    enddo
+  enddo
+  if (any(magnetic_axis_dof)) call boundary_conditions_zero_dofs( &
+      magnetic_axis_dof,magnetic_axis_value,var_A3,1,index_min,index_max,rhs_loc,a_mat)
+endif
+
 if (RMP_on) then
   if (allocated(psi_RMP_cos1))         call tr_deallocate(psi_RMP_cos1,"psi_RMP_cos1",CAT_UNKNOWN)
   if (allocated(dpsi_RMP_cos_dR1))     call tr_deallocate(dpsi_RMP_cos_dR1,"dpsi_RMP_cos_dR1",CAT_UNKNOWN)
@@ -1010,5 +1092,19 @@ endif
 
 return
 end subroutine boundary_conditions 
+
+logical function magnetic_axis_node(node) result(on_axis)
+  use data_structure, only: type_node
+  use mod_parameters, only: n_order
+  use phys_module, only: n_radial, n_flux
+  implicit none
+  type(type_node), intent(in) :: node
+  ! Rectangular physical Hermite DOFs [value,R,Z,RZ], not a polar grid centre.
+  on_axis = n_order == 3 .and. n_radial == 0 .and. n_flux == 0 .and. &
+      .not. node%axis_node .and. (node%boundary == 2 .or. node%boundary == 3) .and. &
+      abs(node%x(1,1,1)) <= 1.d-6 .and. &
+      maxval(abs(node%x(1,2,:) - (/1.d0,0.d0/))) <= 1.d-12 .and. &
+      maxval(abs(node%x(1,3,:) - (/0.d0,1.d0/))) <= 1.d-12
+end function magnetic_axis_node
 
 end module mod_boundary_conditions

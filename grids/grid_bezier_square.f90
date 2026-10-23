@@ -113,6 +113,18 @@ do j=1,nZ
            + sqrt( (node_list%node(inode)%x(1,1,1)-R_geo)**2 +(node_list%node(inode)%x(1,1,2)-Z_geo)**2 )
     endif
 
+#if JOREK_MODEL == 710
+    ! Cylindrical rectangular GS boundary: the prescribed c*R**2 trace needs
+    ! physical Hermite derivatives as well as values. Leave the interior guess
+    ! (including psi_axis_init) untouched; its DOFs are free in the GS solve.
+    if (boundary .and. n_order == 3 .and. n_radial == 0 .and. n_flux == 0 &
+        .and. abs(R_begin) <= 1.d-12 .and. R_end > R_begin &
+        .and. node_list%node(inode)%boundary /= 0) then
+      node_list%node(inode)%values(1,2,1) = 2.d0*rect_grid_vac_psi*node_list%node(inode)%x(1,1,1)
+      node_list%node(inode)%values(1,3:4,1) = 0.d0
+    endif
+#endif
+
     do k=1, n_degrees
       node_list%node(inode)%index(k) = n_degrees*(inode-1) + k
     enddo

@@ -10,7 +10,7 @@ use tr_module
 use data_structure
 use phys_module, only: amix, amix_freeb, delta_psi_GS, newton_GS_freebnd, newton_GS_fixbnd, &
                        n_limiter, treat_axis, fix_axis_nodes, &
-                       use_mumps_eq, use_pastix_eq, use_strumpack_eq
+                       use_mumps_eq, use_pastix_eq, use_strumpack_eq, n_radial, n_flux
 use equil_info,  only: ES
 use vacuum_equilibrium, only: vacuum_equil
 use mpi_mod
@@ -80,6 +80,8 @@ integer  :: n_AA, nz_AA, nz_AA_old, n_border, ilarge, ife, iv, iv2, iv3, iv4, i,
 integer  :: inode, inode1, inode2, inode3, inode4, bnd1, bnd2, vertex(2), direction(2), i_n(n_coord_tor)
 integer  :: i_tor, k_tor, index_large_i, knode, index_large_k, index_ij, index_kl, index, index_i
 logical   :: newton_method_GS
+logical   :: cylindrical_gs_axis(node_list%n_nodes)
+logical, allocatable :: cylindrical_gs_row(:)
 
 real*8, dimension(4,n_degrees)   :: H, H_s, H_t, H_st
 real*8, dimension(4,n_degrees)   :: G_axis, G_bnd, G_s, G_t, G_st, G_ss, G_tt
@@ -102,7 +104,24 @@ real*8 :: tmp
 
 real*8 :: new_dofs(1:4,n_coord_tor), old_dofs(1:4)
 
+cylindrical_gs_axis = .false.
 if (my_id == 0) then
+#if JOREK_MODEL == 710
+  ! The cylindrical boundary is distinct from the magnetic-axis grid centre.
+  ! Restrict to the n=0, bicubic rectangular fixed-boundary flux GS solve.
+  if (itype == -1 .and. .not. freeboundary_equil .and. i_harm == 1 .and. ivar_out == 1 &
+      .and. n_order == 3 .and. n_radial == 0 .and. n_flux == 0) then
+    do i=1,node_list%n_nodes
+      cylindrical_gs_axis(i) = node_list%node(i)%boundary /= 0 &
+          .and. .not. node_list%node(i)%axis_node &
+          .and. abs(node_list%node(i)%x(1,1,1)) <= 1.d-12 &
+          .and. maxval(abs(node_list%node(i)%x(1,2,:) - (/1.d0,0.d0/))) <= 1.d-12 &
+          .and. maxval(abs(node_list%node(i)%x(1,3,:) - (/0.d0,1.d0/))) <= 1.d-12
+      ! Set the prescribed boundary data before assembling the GS residual.
+      if (cylindrical_gs_axis(i)) node_list%node(i)%values(i_harm,:,ivar_out) = 0.d0
+    enddo
+  endif
+#endif
   write(*,*) '**************************************'
   write(*,*) '*            Poisson                 *'
   write(*,*) '**************************************'
@@ -134,6 +153,10 @@ if (my_id == 0) then
   n_border = 0
   if (itype .ne. 0) then
     do i=1,node_list%n_nodes
+      if (cylindrical_gs_axis(i)) then
+        n_border = n_border + n_degrees
+        cycle ! Includes corner constraints exactly once.
+      endif
       if (treat_axis) then
         ! --- Only one fixed for fixed-axis (only valid for G1-cases at the moment!!!)
 #if STELLARATOR_MODEL
@@ -198,6 +221,14 @@ if (my_id == 0) then
   n_AA = n_AA * n_coord_tor
 #endif
   
+  if (any(cylindrical_gs_axis)) then
+    allocate(cylindrical_gs_row(n_AA))
+    cylindrical_gs_row = .false.
+    do i=1,node_list%n_nodes
+      if (cylindrical_gs_axis(i)) cylindrical_gs_row(node_list%node(i)%index(:)) = .true.
+    enddo
+  endif
+
   if (iter .le. 1) then
     write(*,*) ' number of unknowns      : ',n_AA, node_list%n_nodes * n_degrees_per_node
     write(*,*) ' number of boundary nodes: ',n_border
@@ -461,6 +492,16 @@ if (my_id == 0) then
   
   zbig = 1.d10
 
+  if (allocated(cylindrical_gs_row)) then
+    ! Strong homogeneous correction: the prescribed axis data are already zero.
+    ! Remove their physical rows AND columns, then add one diagonal per DOF
+    ! below. This preserves symmetry and prevents a penalty-sized singular trace.
+    do i=1,ilarge
+      if (cylindrical_gs_row(a_mat%irn(i)) .or. cylindrical_gs_row(a_mat%jcn(i))) a_mat%val(i) = 0.d0
+    enddo
+    where (cylindrical_gs_row) rhs_vec%val = 0.d0
+  endif
+
 end if ! my_id == 0
 
 !----------------------- boundary conditions
@@ -628,6 +669,17 @@ elseif (itype .ne. 0) then        ! apply fixed boundary conditions (not for var
     call calculate_node_indices(node_indices)
 
     do i=1,node_list%n_nodes
+
+      if (cylindrical_gs_axis(i)) then
+        do k=1,n_degrees
+          index_i = node_list%node(i)%index(k)
+          a_mat%irn(ilarge+1) = index_i
+          a_mat%jcn(ilarge+1) = index_i
+          a_mat%val(ilarge+1) = zbig
+          ilarge = ilarge + 1
+        enddo
+        cycle ! The Z-cap corner constraints are included in these four rows.
+      endif
   
       ! --- On axis, we fix the t-derivatives, plus all cross-derivatives
       if (node_list%node(i)%axis_node) then
