@@ -3,6 +3,7 @@ module mod_gk_neutral_recycling
 use mpi
 use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
 use mod_particle_sim, only: particle_sim
+use mod_particle_slot_pool
 use mod_particle_types, only: particle_gc_vpar, particle_kinetic_leapfrog, codify_particle_type
 use mod_pcg32_rng, only: pcg32_rng
 use mod_random_seed, only: random_seed
@@ -137,44 +138,69 @@ subroutine boundary_sides(sim,element,sides)
   enddo
 end subroutine
 
-!> Serial, rank-local transaction. Optional ierr returns validation failures without
-!> aborting (for tests/callers); particles and RNG remain unchanged on failure.
-!> dt is the actual ion substep, used in unresolved-crossing diagnostics.
-subroutine recycle_lost_gk_ions(sim,state,birth_time,dt,ierr)
+!> Collective transaction, including ranks without local losses. Pool operations are
+!> rank-local; the error vote precedes all particle, pool, RNG and diagnostic commits.
+subroutine recycle_lost_gk_ions(sim,state,registry,birth_time,dt,ierr)
   class(particle_sim), intent(inout) :: sim
   type(gk_neutral_recycling_state), intent(inout) :: state
+  type(particle_slot_registry), intent(inout) :: registry
   real*8, intent(in) :: birth_time,dt
   integer, optional, intent(out) :: ierr
-  integer :: error,mpierr
+  type(gk_neutral_recycling_state) :: staged
+  type(particle_kinetic_leapfrog), allocatable :: products(:)
+  integer, allocatable :: sources(:),slots(:)
+  integer :: local_error,error,mpierr,k
   if(present(ierr)) ierr=0
   if(.not.state%enabled) return
-  call recycle_transaction(sim,state,birth_time,dt,error)
-  if(error==0) return
-  state%counts(5)=state%counts(5)+1
-  if(present(ierr)) then
-    ierr=error
-  else
-    call MPI_ABORT(MPI_COMM_WORLD,1,mpierr)
+  call recycle_transaction(sim,state,registry,birth_time,dt,sources,slots,products,staged,local_error)
+  call MPI_ALLREDUCE(local_error,error,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,mpierr)
+  if(error/=0) then
+    if(local_error/=0) state%counts(5)=state%counts(5)+1
+    if(present(ierr)) then
+      ierr=error
+    else
+      call MPI_ABORT(MPI_COMM_WORLD,1,mpierr)
+    endif
+    return
   endif
+  ! Commit order: complete products, source deactivation, consumption, release, state.
+  select type(neutrals=>sim%groups(state%neutral_group)%particles)
+  type is(particle_kinetic_leapfrog)
+    do k=1,size(sources)
+      neutrals(slots(k))=products(k)
+    enddo
+  end select
+  sim%groups(state%ion_group)%particles(sources)%i_elm=0
+  call commit_particle_slot_consumption(registry%pool(state%neutral_group),slots)
+  call commit_particle_slot_release(registry%pool(state%ion_group),sources)
+  state=staged
 end subroutine
 
-subroutine recycle_transaction(sim,state,birth_time,dt,error)
-  class(particle_sim), intent(inout) :: sim
-  type(gk_neutral_recycling_state), intent(inout) :: state
+subroutine recycle_transaction(sim,state,registry,birth_time,dt,sources,slots,products,staged,error)
+  class(particle_sim), intent(in) :: sim
+  type(gk_neutral_recycling_state), intent(in) :: state
+  type(particle_slot_registry), intent(in) :: registry
+  type(gk_neutral_recycling_state), intent(out) :: staged
   real*8, intent(in) :: birth_time,dt
   integer, intent(out) :: error
   integer :: g,h,j,k,n,available,e,side,nside,slot,nmultiple
-  integer, allocatable :: sources(:),slots(:)
+  integer, allocatable, intent(out) :: sources(:),slots(:)
   real*8, allocatable :: normals(:,:),speed2(:),energies(:)
-  type(particle_kinetic_leapfrog), allocatable :: products(:)
+  type(particle_kinetic_leapfrog), allocatable, intent(out) :: products(:)
   type(pcg32_rng) :: rng
   real*8 :: distances(4),r,rs,rt,z,zs,zt,jac,normal(3),u(2),direction(3),scale,emitted
   logical :: sides(4),allowed(4)
   character(len=180) :: message
+  staged=state
   call validate_groups(sim,state,error)
   if(error/=0) return
-  error=1
   g=state%ion_group; h=state%neutral_group
+  call check_particle_slot_registry_groups(sim,registry,[g,h],error)
+  if(error/=0) then
+    call reject(sim,h,0,'slot registry is uninitialized or does not match configured groups')
+    return
+  endif
+  error=1
   if(.not.ieee_is_finite(birth_time).or.abs(birth_time)>real(huge(0.e0),8)) then
     call reject(sim,h,0,'invalid birth time; expected finite representable physical end time')
     return
@@ -184,23 +210,27 @@ subroutine recycle_transaction(sim,state,birth_time,dt,error)
   select type(neutrals=>sim%groups(h)%particles)
   type is(particle_kinetic_leapfrog)
     n=count(ions%i_elm<0)
-    available=count(neutrals%i_elm==0)
+    available=registry%pool(h)%n_free
     if(n>available) then
       write(message,*) 'insufficient local capacity: required=',n,' available i_elm==0 slots=',available
       call reject(sim,h,0,message)
+      return
+    endif
+    allocate(sources(n),slots(n),normals(3,n),speed2(n),energies(n),products(n))
+    call peek_particle_slots(registry%pool(h),n,slots,error)
+    if(error/=0) then
+      call reject(sim,h,0,'invalid neutral pool consumption')
+      return
+    endif
+    error=1
+    if(any(neutrals(slots)%i_elm/=0)) then
+      call reject(sim,h,0,'pool destination is not physically reusable')
       return
     endif
     if(n==0) then
       error=0
       return
     endif
-    allocate(sources(n),slots(n),normals(3,n),speed2(n),energies(n),products(n))
-    k=0
-    do j=1,size(neutrals)
-      if(neutrals(j)%i_elm/=0) cycle
-      k=k+1; slots(k)=j
-      if(k==n) exit
-    enddo
     nmultiple=0
     ! Pass 1: validate every source and prepare geometry/energy without mutation.
     k=0
@@ -216,7 +246,7 @@ subroutine recycle_transaction(sim,state,birth_time,dt,error)
       call boundary_sides(sim,e,sides)
       nside=count(sides)
       if(nside==0) then
-        state%counts(3)=state%counts(3)+1
+        staged%counts(3)=staged%counts(3)+1
         call reject(sim,g,j,'unresolved non-boundary last element; reduce the particle timestep')
         write(*,*) ' rank=',sim%my_id,' particle=',j,' i_last=',e,' x=',ions(j)%x, &
                    ' st=',ions(j)%st,' vpar=',ions(j)%vpar,' mu=',ions(j)%mu,' particle timestep=',dt
@@ -283,6 +313,12 @@ subroutine recycle_transaction(sim,state,birth_time,dt,error)
       products(k)%st=ions(j)%st
       products(k)%i_elm=e
     enddo
+    call check_particle_slots_for_release(registry%pool(g),sources,error)
+    if(error/=0) then
+      call reject(sim,g,0,'invalid source-ion release transaction')
+      return
+    endif
+    error=1
     ! Pass 2: sample on a copy of the stream, stage complete products, then commit.
     rng=state%rng
     do k=1,n
@@ -296,6 +332,10 @@ subroutine recycle_transaction(sim,state,birth_time,dt,error)
       products(k)%v=sqrt(speed2(k))*direction
       products(k)%q=0
       products(k)%weight=ions(j)%weight
+      if(neutrals(slot)%i_life==huge(0)) then
+        call reject(sim,h,slot,'destination lifetime would overflow')
+        return
+      endif
       products(k)%i_life=neutrals(slot)%i_life+1
       products(k)%t_birth=real(birth_time,4)
       emitted=0.5d0*sim%groups(h)%mass*ATOMIC_MASS_UNIT*products(k)%weight*sum(products(k)%v**2)
@@ -307,15 +347,13 @@ subroutine recycle_transaction(sim,state,birth_time,dt,error)
     enddo
     do k=1,n
       j=sources(k); slot=slots(k)
-      neutrals(slot)=products(k)
-      state%counts(1:2)=state%counts(1:2)+1
-      state%totals=state%totals+[ions(j)%weight,energies(k),products(k)%weight, &
+      staged%counts(1:2)=staged%counts(1:2)+1
+      staged%totals=staged%totals+[ions(j)%weight,energies(k),products(k)%weight, &
            0.5d0*sim%groups(h)%mass*ATOMIC_MASS_UNIT*products(k)%weight*sum(products(k)%v**2), &
            EL_CHG*ions(j)%weight]
-      ions(j)%i_elm=0 ! only after creation and incident accounting
     enddo
-    state%counts(4)=state%counts(4)+nmultiple
-    state%rng=rng
+    staged%counts(4)=staged%counts(4)+nmultiple
+    staged%rng=rng
   end select
   end select
   error=0

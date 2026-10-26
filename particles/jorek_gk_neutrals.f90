@@ -9,6 +9,7 @@ end module
 program jorek_gk_neutrals
 use mod_particle_types
 use mod_particle_sim
+use mod_particle_slot_pool
 use mod_gk_neutral_recycling, only: gk_neutral_recycling_state, initialize_gk_neutral_recycling, &
                                     recycle_lost_gk_ions, report_gk_neutral_recycling
 use mod_gk_neutrals, only: gk_neutral_state, initialize_gk_neutrals, advance_gk_neutrals, &
@@ -82,6 +83,9 @@ type(type_element_list), target                   :: eq_element_list
 !type(type_bnd_element_list) :: bnd_elm_list !< List of boundary elements
 !type(type_bnd_node_list)    :: bnd_node_list !< List of boundary nodes.
 
+type(particle_slot_registry) :: slot_registry
+integer, allocatable :: slot_groups(:)
+logical, parameter :: debug_slot_pools=.false.
 type(gk_neutral_state) :: neutrals
 type(gk_neutral_recycling_state) :: recycling
 
@@ -103,8 +107,8 @@ real*8, external :: T_ions, T_electrons
 integer   :: ifail, node_start, node_end
 integer   :: i, j, k, l, m, in, jn, inode, i_elm, index_rhs, i_diagno(6)
 integer   :: seed, i_rng, n_stream, ierr, i_tor, i_tor_start
-integer   :: n_ions_lost, n_electrons_lost, n_ions_lost_max, n_electrons_lost_max
-integer, allocatable :: index_lost_ions(:), index_lost_electrons(:)
+integer   :: n_newly_lost_ions, n_newly_lost_electrons
+integer, allocatable :: newly_lost_ions(:), newly_lost_electrons(:)
 real*8    :: energy_local_lost_ions, energy_total_lost_ions, energy_local_lost_electrons, energy_total_lost_electrons, sum_energy
 real*8    :: energy_local_ions, energy_local_electrons, energy_total_ions, energy_total_electrons
 real*8    :: momentum_local_lost_ions, momentum_total_lost_ions, momentum_local_lost_electrons, momentum_total_lost_electrons, sum_momentum
@@ -295,15 +299,16 @@ if (.not. restart_particles) then
 
 endif  ! restart_particles
 
-! Charged loss bookkeeping is also needed when starting from a particle restart.
-  n_ions_local      = size(sim%groups(ion_group)%particles,1)
-  n_electrons_local = size(sim%groups(electron_group)%particles,1)
-  allocate(index_lost_ions(int(zero_fraction*n_ions_local)),     index_lost_electrons(int(zero_fraction*n_electrons_local)))
-
-  n_ions_lost      = 0
-  n_electrons_lost = 0
-  n_ions_lost_max      = size(index_lost_ions)
-  n_electrons_lost_max = size(index_lost_electrons)
+! Particle initialization/import and all initial masks are now complete.
+slot_groups=[ion_group,electron_group]
+if(neutral_group<=size(sim%groups)) slot_groups=[ion_group,electron_group,neutral_group]
+call initialize_particle_slot_registry(sim,slot_groups,slot_registry)
+! Loss events are transient and never serve as reusable-slot lists.
+n_ions_local=size(sim%groups(ion_group)%particles)
+n_electrons_local=size(sim%groups(electron_group)%particles)
+allocate(newly_lost_ions(n_ions_local),newly_lost_electrons(n_electrons_local))
+n_newly_lost_ions=0; n_newly_lost_electrons=0
+call check_debug_pools()
 
 call initialize_gk_neutrals(sim, neutral_group, neutrals)
 call initialize_gk_neutral_recycling(sim, ion_group, neutral_group, recycling)
@@ -407,6 +412,7 @@ endif
 
 do i=1, nstep_particles
 
+  n_newly_lost_ions=0; n_newly_lost_electrons=0
   particle_start_time = sim%time
 
   index_now = index_now + 1
@@ -426,7 +432,7 @@ do i=1, nstep_particles
   call loop_particle_gc_local(sim, ion_group, 4, ion_group, electron_group,              &
                               jorek_feedback, project_profiles, project_density,         &
                               tstep_particles, nsubstep_particles, particle_start_time, &
-                              index_lost_ions, n_ions_lost, n_ions_lost_max,             &
+                              newly_lost_ions, n_newly_lost_ions,             &
                               energy_local_ions,      energy_local_lost_ions,            &
                               momentum_local_ions,    momentum_local_lost_ions,          &
                               potential_local_ions,   potential_local_lost_ions,         &
@@ -470,7 +476,7 @@ do i=1, nstep_particles
     call loop_particle_gc_local(sim, electron_group, 0,  ion_group, electron_group,           &
                                 jorek_feedback, project_profiles, project_density,            &
                                 tstep_electrons, nsubstep_particles, particle_start_time,     &
-                                index_lost_electrons, n_electrons_lost, n_electrons_lost_max, &
+                                newly_lost_electrons, n_newly_lost_electrons, &
                                 energy_local_electrons,    energy_local_lost_electrons,       &
                                 momentum_local_electrons,  momentum_local_lost_electrons,     &
                                 potential_local_electrons, potential_local_lost_electrons,    &
@@ -534,8 +540,8 @@ do i=1, nstep_particles
   if (sim%my_id == 0) write(*,*) sim%my_id,'TIMESTEPS : ',index_now,xtime(index_now),sim%time,t_now
 
   call MPI_BARRIER(MPI_COMM_WORLD,ierr)
-  call MPI_ALLREDUCE(n_ions_lost,         total_ions_lost,       1, MPI_INTEGER,          MPI_SUM, MPI_COMM_WORLD, ierr)
-  call MPI_ALLREDUCE(n_electrons_lost,    total_electrons_lost,  1, MPI_INTEGER,          MPI_SUM, MPI_COMM_WORLD, ierr)
+  call MPI_ALLREDUCE(n_newly_lost_ions,         total_ions_lost,       1, MPI_INTEGER,          MPI_SUM, MPI_COMM_WORLD, ierr)
+  call MPI_ALLREDUCE(n_newly_lost_electrons,    total_electrons_lost,  1, MPI_INTEGER,          MPI_SUM, MPI_COMM_WORLD, ierr)
   call MPI_REDUCE(energy_local_ions,             energy_total_ions,             1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
   call MPI_REDUCE(energy_local_lost_ions,        energy_total_lost_ions,        1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
   call MPI_REDUCE(energy_local_electrons,        energy_total_electrons,        1, MPI_DOUBLE_PRECISION, MPI_SUM, 0, MPI_COMM_WORLD, ierr)
@@ -561,7 +567,9 @@ do i=1, nstep_particles
 
   ! Charged loss diagnostics are complete. New products first move next outer step.
   call advance_gk_neutrals(sim, neutrals, tstep_particles, nsubstep_particles)
-  call recycle_lost_gk_ions(sim, recycling, sim%time, tstep_particles)
+  call recycle_lost_gk_ions(sim, recycling, slot_registry, sim%time, tstep_particles)
+  call finalize_lost_electrons()
+  call check_debug_pools()
 
   if (sim%my_id .eq. 0) then
     call itg_energy(node_list,element_list,min(psi_start,psi_end),max(psi_start,psi_end),W_kin,W_tot)
@@ -672,11 +680,40 @@ if (nstep_particles .gt. 0) then
     poisson_rhs%n = 0
   endif
   
+  call finalize_particle_slot_registry(slot_registry)
   call sim%finalize
 
 endif
 
 contains
+
+subroutine check_debug_pools()
+  integer :: g
+  if(.not.debug_slot_pools) return
+  call validate_particle_slot_registry(sim,slot_registry,slot_groups)
+  do g=1,size(slot_groups)
+    write(*,*) 'GK slot pool rank/group/free=',sim%my_id,slot_groups(g),slot_registry%pool(slot_groups(g))%n_free
+  enddo
+end subroutine
+
+subroutine finalize_lost_electrons()
+  integer :: local_error,error,mpierr
+  ! Loss energies/momenta and counts have already been reduced/written. There is
+  ! no electron wall-processing consumer in this main. Imported negative markers
+  ! are not current loss events and remain protected for explicit future handling.
+  call check_particle_slots_for_release(slot_registry%pool(electron_group), &
+       newly_lost_electrons(:n_newly_lost_electrons),local_error)
+  if(any(sim%groups(electron_group)%particles(newly_lost_electrons(:n_newly_lost_electrons))%i_elm>=0)) &
+    local_error=1
+  call MPI_ALLREDUCE(local_error,error,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,mpierr)
+  if(error/=0) then
+    write(*,*) 'ERROR: GK electron loss finalization rank=',sim%my_id
+    call MPI_ABORT(MPI_COMM_WORLD,1,mpierr)
+  endif
+  sim%groups(electron_group)%particles(newly_lost_electrons(:n_newly_lost_electrons))%i_elm=0
+  call commit_particle_slot_release(slot_registry%pool(electron_group), &
+       newly_lost_electrons(:n_newly_lost_electrons))
+end subroutine
 
 subroutine electron_ion_collision_frequency(zni, Te, electron_mass, collision_frequency)
 use constants
@@ -799,7 +836,7 @@ end
 subroutine loop_particle_gc_local(sim, i_group, n_orbit, ion_group, electron_group ,                        &
                                  jorek_feedback, project_profiles, project_density,                         &
                                  timesteps, n_steps, particle_start_time,                                   &
-                                 lost, n_lost, n_lost_max,                                                  &
+                                 lost, n_lost,                                                  &
                                  energy_local, energy_lost_local, momentum_local, momentum_lost_local,      &
                                  potential_energy_local, potential_energy_lost_local, update)
 use mod_parameters
@@ -831,9 +868,8 @@ type(projection), target, intent(in)          :: project_density            ! pr
 real*8, intent(in)                            :: timesteps, particle_start_time ! the particle time step and starting time [s]
 integer, intent(in)                           :: n_steps                    ! the number of time steps
 logical, intent(in)                           :: update                     ! switch to update particle position (.true.) or calculate only rhs contribution to Poisson (not used currenly)
-integer                                       :: lost(*)                    ! stores the index of lost particles
+integer, intent(inout)                        :: lost(:) ! transient newly-lost events only
 integer                                       :: n_lost                     ! the current number of lost particles in lost array
-integer                                       :: n_lost_max                 ! the maximum number of lost particles to store (size(lost))
 real*8                                        :: energy_local,    energy_lost_local   ! the energy and energy loss in this timestep [J]
 real*8                                        :: momentum_local,  momentum_lost_local ! momentum and momentum loss in this timeste [kg m/s] (?)
 real*8                                        :: potential_energy_local, potential_energy_lost_local ! potential energy and potential energy loss [J]
@@ -924,7 +960,7 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
   !$omp shared(sim, particles, n_steps, timesteps, particle_start_time, update, retain_wall_metadata, &
   !$omp rho_norm, t_norm, v_norm, E_norm, M_norm, zn_norm, Tev_norm, n_phases,   &
   !$omp n_orbit, central_density, central_mass, F0, i_group, electron_group,     &
-  !$omp rng, lost, n_lost, n_lost_max, ion_group,                                &
+  !$omp rng, lost, n_lost, ion_group,                                &
   !$omp ei_small_angle_scattering_Orb5, ei_small_angle_scattering_Lu,            &
   !$omp project_profiles, project_density)                                       &
   !$omp private(particle_tmp, i_rng, i,j,k,l,m, t, E, B, psi, U, rz_old, st_old, lost_st, lost_phi, &
@@ -968,11 +1004,10 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
         momentum_lost_local         = momentum_lost_local         + particle_tmp%vpar * particle_tmp%weight
 !        potential_energy_lost_local = potential_energy_lost_local + 0.5d0 * EL_CHG * particles(j)%q * F0 * U * particles(j)%weight
         !$omp critical
-        if (n_lost .lt. n_lost_max) then
-          if (i_group .eq. 2) write(*,*) ' lost : ',j, n_lost,n_lost_max
-          n_lost       = n_lost + 1   ! check for size overrun
-          lost(n_lost) = j
-        endif
+        ! Each active-to-lost transition occurs once; buffer spans the local array.
+        if(n_lost>=size(lost)) error stop 'GK newly-lost event buffer overflow'
+        n_lost=n_lost+1
+        lost(n_lost)=j
         !$omp end critical
       endif
     endif

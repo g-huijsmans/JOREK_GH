@@ -3,6 +3,7 @@ module mod_gk_neutral_ionization
 use mpi
 use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
 use mod_particle_sim, only: particle_sim
+use mod_particle_slot_pool
 use mod_particle_types, only: particle_gc_vpar, particle_kinetic_leapfrog, codify_particle_type
 use mod_find_rz_nearby, only: find_RZ_nearby
 use mod_math_operators, only: cross_product
@@ -142,9 +143,10 @@ end subroutine
 
 !> Validate, stage, vote globally, then commit. No allocation/growth or migration of
 !> particle slots; lost (negative-index) destinations are deliberately protected.
-subroutine ionize_selected_gk_neutrals(sim,state,neutral_indices,reaction_time,ierr)
+subroutine ionize_selected_gk_neutrals(sim,state,registry,neutral_indices,reaction_time,ierr)
   class(particle_sim), intent(inout) :: sim
   type(gk_neutral_ionization_state), intent(inout) :: state
+  type(particle_slot_registry), intent(inout) :: registry
   integer, intent(in) :: neutral_indices(:)
   real*8, intent(in) :: reaction_time
   integer, optional, intent(out) :: ierr
@@ -154,7 +156,7 @@ subroutine ionize_selected_gk_neutrals(sim,state,neutral_indices,reaction_time,i
   integer :: local_error,error,k,n
   n=size(neutral_indices)
   state%counts(1)=state%counts(1)+n
-  call stage_transaction(sim,state,neutral_indices,reaction_time,ions,electrons, &
+  call stage_transaction(sim,state,registry,neutral_indices,reaction_time,ions,electrons, &
                          ion_slots,electron_slots,totals,local_error)
   if(local_error/=0) state%counts(3)=state%counts(3)+1
   call vote(local_error,error,ierr)
@@ -175,14 +177,19 @@ subroutine ionize_selected_gk_neutrals(sim,state,neutral_indices,reaction_time,i
   do k=1,n
     sim%groups(state%neutral_group)%particles(neutral_indices(k))%i_elm=0
   enddo
+  ! Common commit order: products, source deactivation, consumption, release, diagnostics.
+  call commit_particle_slot_consumption(registry%pool(state%ion_group),ion_slots)
+  call commit_particle_slot_consumption(registry%pool(state%electron_group),electron_slots)
+  call commit_particle_slot_release(registry%pool(state%neutral_group),neutral_indices)
   state%counts(2)=state%counts(2)+n
   state%totals=state%totals+totals
   state%reaction_time=reaction_time
 end subroutine
 
-subroutine stage_transaction(sim,state,indices,time,ions,electrons,ion_slots,electron_slots,totals,error)
+subroutine stage_transaction(sim,state,registry,indices,time,ions,electrons,ion_slots,electron_slots,totals,error)
   class(particle_sim), intent(in) :: sim
   type(gk_neutral_ionization_state), intent(in) :: state
+  type(particle_slot_registry), intent(in) :: registry
   integer, intent(in) :: indices(:)
   real*8, intent(in) :: time
   type(particle_gc_vpar), allocatable, intent(out) :: ions(:),electrons(:)
@@ -204,8 +211,15 @@ subroutine stage_transaction(sim,state,indices,time,ions,electrons,ion_slots,ele
     call reject(sim,g,0,'reaction_time must be finite and representable as real*4 t_birth')
     return
   endif
-  ni=count(sim%groups(state%ion_group)%particles%i_elm==0)
-  ne=count(sim%groups(state%electron_group)%particles%i_elm==0)
+  call check_particle_slot_registry_groups(sim,registry, &
+       [state%ion_group,state%electron_group,state%neutral_group],error)
+  if(error/=0) then
+    call reject(sim,g,0,'slot registry is uninitialized or does not match configured groups')
+    return
+  endif
+  error=1
+  ni=registry%pool(state%ion_group)%n_free
+  ne=registry%pool(state%electron_group)%n_free
   if(n>ni.or.n>ne) then
     write(message,*) 'insufficient local capacity: selected=',n,' free ions=',ni,' free electrons=',ne
     call reject(sim,g,0,message)
@@ -214,6 +228,19 @@ subroutine stage_transaction(sim,state,indices,time,ions,electrons,ion_slots,ele
     return
   endif
   allocate(ions(n),electrons(n),ion_slots(n),electron_slots(n))
+  call peek_particle_slots(registry%pool(state%ion_group),n,ion_slots,error)
+  if(error==0) call peek_particle_slots(registry%pool(state%electron_group),n,electron_slots,error)
+  if(error==0) call check_particle_slots_for_release(registry%pool(g),indices,error)
+  if(error/=0) then
+    call reject(sim,g,0,'invalid slot consumption or source release transaction')
+    return
+  endif
+  error=1
+  if(any(sim%groups(state%ion_group)%particles(ion_slots)%i_elm/=0).or. &
+     any(sim%groups(state%electron_group)%particles(electron_slots)%i_elm/=0)) then
+    call reject(sim,g,0,'pool destination is not physically reusable')
+    return
+  endif
   if(n==0) then
     error=0
     return
@@ -226,8 +253,6 @@ subroutine stage_transaction(sim,state,indices,time,ions,electrons,ion_slots,ele
     call reject(sim,g,0,'field mesh unassociated')
     return
   endif
-  call zero_slots(sim,state%ion_group,ion_slots)
-  call zero_slots(sim,state%electron_group,electron_slots)
   select type(p=>sim%groups(g)%particles)
   type is(particle_kinetic_leapfrog)
     do k=1,n
@@ -281,19 +306,6 @@ subroutine stage_transaction(sim,state,indices,time,ions,electrons,ion_slots,ele
     return
   endif
   error=0
-end subroutine
-
-subroutine zero_slots(sim,group,slots)
-  class(particle_sim), intent(in) :: sim
-  integer, intent(in) :: group
-  integer, intent(out) :: slots(:)
-  integer :: j,k
-  k=0
-  do j=1,size(sim%groups(group)%particles)
-    if(sim%groups(group)%particles(j)%i_elm/=0) cycle
-    k=k+1; slots(k)=j
-    if(k==size(slots)) exit
-  enddo
 end subroutine
 
 logical function valid_position(sim,x,st,element) result(valid)
