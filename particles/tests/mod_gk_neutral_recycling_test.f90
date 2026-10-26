@@ -5,7 +5,10 @@ use data_structure
 use mod_particle_sim, only: particle_sim, configure_particle_groups
 use mod_particle_types
 use mod_gk_neutral_recycling
+use mod_particle_slot_pool
+use mod_particle_slot_pool_test, only: assert_slot_registry_equal, snapshot_slot_registry
 use mod_gk_neutrals
+use mod_pcg32_rng, only: pcg32_rng
 use mod_fields_linear, only: jorek_fields_interp_linear
 use mod_projection_helpers_test_tools, only: default_square_grid
 use mod_neighbours, only: update_neighbours
@@ -16,11 +19,81 @@ implicit none
 private
 public :: run_recycling_tests, run_recycling_invalid
 integer, parameter :: ion_group=1, neutral_group=3
+type(particle_slot_registry) :: registry
 integer :: rank,tasks,boundary_element,interior_element,corner_element,boundary_side,corner_side
 real*8 :: wall_st(2),corner_st(2)
 type(type_node_list), target :: nodes
 type(type_element_list), target :: elements
 contains
+
+subroutine checked_report(sim,state)
+  type(particle_sim), intent(in) :: sim
+  type(gk_neutral_recycling_state), intent(inout) :: state
+  type(particle_slot_registry) :: before
+  call snapshot_slot_registry(registry,before)
+  call report_gk_neutral_recycling(sim,state)
+  call assert_slot_registry_equal(registry,before,'report leaves registry unchanged')
+end subroutine
+
+
+subroutine checked_recycle(sim,state,time,dt,ierr)
+  type(particle_sim), intent(inout) :: sim
+  type(gk_neutral_recycling_state), intent(inout) :: state
+  real*8, intent(in) :: time,dt
+  integer, optional, intent(out) :: ierr
+  type(particle_slot_registry) :: before
+  type(gk_neutral_recycling_state) :: old
+  type(pcg32_rng) :: rng_before,rng_after
+  real*8 :: u_before(2),u_after(2)
+  integer :: error,g,n,old_free(3)
+  if(.not.state%enabled) then
+    call recycle_lost_gk_ions(sim,state,registry,time,dt,ierr)
+    return
+  endif
+  call validate_particle_slot_registry(sim,registry,[1,2,3],error)
+  call assert_equals(0,error,'pool agrees before recycling')
+  call snapshot_slot_registry(registry,before); old=state; old_free=registry%pool%n_free
+  n=count(sim%groups(1)%particles%i_elm<0)
+  call recycle_lost_gk_ions(sim,state,registry,time,dt,error)
+  if(error/=0) then
+    call assert_slot_registry_equal(registry,before,'recycling rollback')
+    rng_before=old%rng; rng_after=state%rng
+    call rng_before%next(u_before); call rng_after%next(u_after)
+    call assert_true(all(u_before==u_after),'recycling failure preserves RNG')
+    call assert_true(all(old%totals==state%totals).and.all(old%counts(:4)==state%counts(:4)), &
+                     'recycling failure preserves diagnostics except failed attempts')
+  else
+    call assert_true(all(registry%pool%n_free==old_free+[n,0,-n]),'recycling pool transfers')
+  endif
+  call validate_particle_slot_registry(sim,registry,[1,2,3],g)
+  call assert_equals(0,g,'pool agrees after recycling')
+  if(present(ierr)) then
+    ierr=error
+  else if(error/=0) then
+    call MPI_ABORT(MPI_COMM_WORLD,1,g)
+  endif
+end subroutine
+
+subroutine check_restart_pool(sim)
+  type(particle_sim), intent(in) :: sim
+  type(particle_slot_registry) :: rebuilt
+  integer :: g,j,error,next(1)
+  call initialize_particle_slot_registry(sim,[1,2,3],rebuilt)
+  call validate_particle_slot_registry(sim,rebuilt,[1,2,3],error)
+  call assert_equals(0,error,'restart rebuilt registry valid')
+  do g=1,3
+    call assert_equals(registry%pool(g)%n_slots,rebuilt%pool(g)%n_slots,'restart pool size')
+    call assert_equals(registry%pool(g)%n_free,rebuilt%pool(g)%n_free,'restart free count')
+    do j=1,rebuilt%pool(g)%n_slots
+      call assert_true(is_particle_slot_free(registry%pool(g),j).eqv. &
+                       is_particle_slot_free(rebuilt%pool(g),j),'restart membership')
+    enddo
+    if(rebuilt%pool(g)%n_free>0) then
+      call peek_particle_slots(rebuilt%pool(g),1,next)
+      call assert_equals(findloc(sim%groups(g)%particles%i_elm,0,dim=1),next(1),'restart lowest free first')
+    endif
+  enddo
+end subroutine
 
 subroutine setup_mesh()
   integer :: ierr,e,s,nside,n1,n2,side
@@ -98,6 +171,7 @@ subroutine fixture(sim,number)
     p(3:5)%i_life=7
     p(3:5)%q=1 ! inactive charge is overwritten on creation
   end select
+  call initialize_particle_slot_registry(sim,[1,2,3],registry)
 end subroutine
 
 subroutine run_recycling_tests()
@@ -105,6 +179,7 @@ subroutine run_recycling_tests()
   call run_test_case(single_recycle,'single product, inward motion, replay and no double recycling')
   call run_test_case(multiple_restart,'multiple unequal markers and MPI-safe restart')
   call run_test_case(transaction_checks,'capacity, adjacent boundary nodes, corner and invalid wall state')
+  call run_test_case(cross_rank_rollback,'global recycling rollback of particles, pools and RNG')
 end subroutine
 
 subroutine check_neutral(a,b,label)
@@ -129,12 +204,12 @@ subroutine single_recycle()
   integer :: j
   allocate(empty%groups(2))
   call initialize_gk_neutral_recycling(empty,ion_group,neutral_group,disabled)
-  call recycle_lost_gk_ions(empty,disabled,0.d0,1.d-7)
-  call report_gk_neutral_recycling(empty,disabled)
+  call checked_recycle(empty,disabled,0.d0,1.d-7)
+  call checked_report(empty,disabled)
   call assert_true(.not.disabled%enabled,'charged-only recycling no-op')
   call fixture(sim,1)
   call initialize_gk_neutral_recycling(sim,ion_group,neutral_group,state)
-  call recycle_lost_gk_ions(sim,state,0.25d0,1.d-7)
+  call checked_recycle(sim,state,0.25d0,1.d-7)
   select type(p=>sim%groups(3)%particles)
   type is(particle_kinetic_leapfrog)
     saved=p
@@ -154,9 +229,9 @@ subroutine single_recycle()
       call assert_equals(0,sim%groups(1)%particles(1)%i_elm,'source inactive')
     endif
   end select
-  call report_gk_neutral_recycling(sim,state)
+  call checked_report(sim,state)
   if(rank==0) call assert_equals(1,state%global_counts(1),'one global source')
-  call recycle_lost_gk_ions(sim,state,0.3d0,1.d-7)
+  call checked_recycle(sim,state,0.3d0,1.d-7)
   call assert_true(all(state%counts==0).and.all(state%totals==0.d0),'no double recycling increments')
   select type(p=>sim%groups(3)%particles)
   type is(particle_kinetic_leapfrog)
@@ -164,10 +239,10 @@ subroutine single_recycle()
       call check_neutral(saved(j),p(j),'second call unchanged')
     enddo
   end select
-  call report_gk_neutral_recycling(sim,state)
+  call checked_report(sim,state)
   call fixture(replay,1)
   call initialize_gk_neutral_recycling(replay,ion_group,neutral_group,again)
-  call recycle_lost_gk_ions(replay,again,0.25d0,1.d-7)
+  call checked_recycle(replay,again,0.25d0,1.d-7)
   select type(p=>replay%groups(3)%particles)
   type is(particle_kinetic_leapfrog)
     do j=1,5
@@ -197,8 +272,8 @@ subroutine multiple_restart()
   character(len=160) :: filename
   call fixture(sim,3)
   call initialize_gk_neutral_recycling(sim,ion_group,neutral_group,state)
-  call recycle_lost_gk_ions(sim,state,0.25d0,1.d-7)
-  call report_gk_neutral_recycling(sim,state)
+  call checked_recycle(sim,state,0.25d0,1.d-7)
+  call checked_report(sim,state)
   expected_energy=0.d0
   do j=1,3
     expected_energy=expected_energy+0.5d0*2.01410178d0*ATOMIC_MASS_UNIT*1.d10*j*(100.d0**2*j*j+80.d0*j)
@@ -241,6 +316,7 @@ subroutine multiple_restart()
   call configure_particle_groups(restored)
   call read_simulation_hdf5(restored,trim(filename),test_in=.true.)
   call assert_equals('neu',restored%groups(3)%id,'restart group ID')
+  call check_restart_pool(restored)
   select type(p=>restored%groups(3)%particles)
   type is(particle_kinetic_leapfrog)
     do j=1,5
@@ -299,7 +375,8 @@ subroutine transaction_checks()
     type is(particle_kinetic_leapfrog)
       saved=p
     end select
-    call recycle_lost_gk_ions(sim,state,0.25d0,1.d-7,ierr)
+    call initialize_particle_slot_registry(sim,[1,2,3],registry) ! finalized test fixture
+    call checked_recycle(sim,state,0.25d0,1.d-7,ierr)
     if(k==3) then
       nodes%node(n1)%boundary=old1; nodes%node(n3)%boundary=old3
     endif
@@ -317,6 +394,55 @@ subroutine transaction_checks()
       end select
     endif
   enddo
+end subroutine
+
+subroutine cross_rank_rollback()
+  type(particle_sim) :: sim
+  type(gk_neutral_recycling_state) :: state
+  type(particle_gc_vpar) :: ions(3),electron(1)
+  type(particle_kinetic_leapfrog) :: neutrals(5)
+  integer :: j,error
+  call fixture(sim,3)
+  call initialize_gk_neutral_recycling(sim,ion_group,neutral_group,state)
+  if(rank==min(1,tasks-1)) sim%groups(3)%particles(3:5)%i_elm=-boundary_element
+  call initialize_particle_slot_registry(sim,[1,2,3],registry)
+  select type(p=>sim%groups(1)%particles)
+  type is(particle_gc_vpar)
+    ions=p
+  end select
+  select type(p=>sim%groups(2)%particles)
+  type is(particle_gc_vpar)
+    electron=p
+  end select
+  select type(p=>sim%groups(3)%particles)
+  type is(particle_kinetic_leapfrog)
+    neutrals=p
+  end select
+  call checked_recycle(sim,state,0.25d0,1.d-7,error)
+  call assert_true(error/=0,'rank-one failure rejects on every rank')
+  select type(p=>sim%groups(1)%particles)
+  type is(particle_gc_vpar)
+    do j=1,size(p)
+      call check_gc(p(j),ions(j))
+    enddo
+  end select
+  select type(p=>sim%groups(2)%particles)
+  type is(particle_gc_vpar)
+    call check_gc(p(1),electron(1))
+  end select
+  select type(p=>sim%groups(3)%particles)
+  type is(particle_kinetic_leapfrog)
+    do j=1,size(p)
+      call check_neutral(p(j),neutrals(j),'cross-rank rollback')
+    enddo
+  end select
+end subroutine
+
+subroutine check_gc(a,b)
+  type(particle_gc_vpar), intent(in) :: a,b
+  call assert_true(all(a%x==b%x).and.all(a%st==b%st).and.a%i_elm==b%i_elm.and. &
+       a%q==b%q.and.a%weight==b%weight.and.a%vpar==b%vpar.and.a%mu==b%mu.and. &
+       a%B_norm==b%B_norm.and.a%i_life==b%i_life.and.a%t_birth==b%t_birth,'complete GC rollback')
 end subroutine
 
 subroutine run_recycling_invalid(mode)
@@ -365,7 +491,8 @@ subroutine run_recycling_invalid(mode)
     enddo
   end select
   call initialize_gk_neutral_recycling(sim,ion_group,neutral_group,state)
-  call recycle_lost_gk_ions(sim,state,0.25d0,1.d-7)
+  call initialize_particle_slot_registry(sim,[1,2,3],registry)
+  call recycle_lost_gk_ions(sim,state,registry,0.25d0,1.d-7)
 end subroutine
 
 subroutine unique_filename(filename)
