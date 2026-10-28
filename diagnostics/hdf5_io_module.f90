@@ -12,10 +12,12 @@
 module hdf5_io_module
 #ifdef USE_HDF5  
   use HDF5
+  use iso_fortran_env, only: int64
   implicit none
 
   ! Parameters to be used within the module
   integer,parameter :: master_task=0
+  private :: prepare_array_read, close_array_read
 
   !******************************
   contains
@@ -2409,62 +2411,171 @@ end subroutine HDF5_array1D_reading_char_len
   ! outputs:
   !   array1D:            (integer)(:)(allocatable) array of characters to be read from file
   !---------------------------------------- 
-  subroutine HDF5_allocatable_array1D_reading_int(file_id,array1D,dsetname,reqdims_in,start)
-    !> inputs:
-    integer(HID_T),intent(in)                         :: file_id    ! file identifier
-    character(len=*),intent(in)                       :: dsetname   ! dataset name
-    integer(HSIZE_T),dimension(1),intent(in),optional :: start      ! offset array to read
-    integer(HSIZE_T),dimension(1),intent(in),optional :: reqdims_in ! requested slab dimensions
-    !> inputs-outputs:
-    integer,dimension(:),allocatable,intent(inout) :: array1D
-    !> variables:
-    integer(HID_T) :: dataspace_id,dataspace_req_id ! dataspace identifier
-    integer(HID_T) :: dataset_id ! dataset identifier
-    integer        :: rank,error ! dataset rank and hdf5 error
-    integer(HSIZE_T),dimension(1) :: dims,maxdims ! dataset dimensions
-    logical        :: exists     ! true if dataset exists
-    !*** check if dataset exists otherwise return ***
+  ! Prepare numeric allocatable reads without copying signed sentinels into
+  ! HDF5 counts. In particular, keep allocation extents separate from counts:
+  ! ifx 2023.2 with -O2 -axCOMMON-AVX512 can reuse a pre-normalization extent
+  ! when a copied request array is conditionally overwritten in place.
+  ! Legacy semantics: ranks >= 2 interpret ANY nonpositive request as the full
+  ! file dimension (not the remainder after start). Rank 1 has no sentinel;
+  ! zero is an empty selection. A slab requires BOTH optional arguments.
+  subroutine prepare_array_read(file_id,dsetname,expected_rank,element_bytes,reqdims_in,start, &
+                                dataset_id,file_space,mem_space,counts,extents,exists,ready)
+    integer(HID_T), intent(in) :: file_id
+    character(len=*), intent(in) :: dsetname
+    integer, intent(in) :: expected_rank,element_bytes
+    integer(HSIZE_T), optional, intent(in) :: reqdims_in(expected_rank),start(expected_rank)
+    integer(HID_T), intent(out) :: dataset_id,file_space,mem_space
+    integer(HSIZE_T), intent(out) :: counts(expected_rank)
+    integer(int64), intent(out) :: extents(expected_rank)
+    logical, intent(out) :: exists,ready
+    integer(HSIZE_T) :: file_dims(expected_rank),max_dims(expected_rank),offset(expected_rank)
+    integer(int64) :: requested,extent,points
+    integer(HSSIZE_T) :: file_points,mem_points
+    integer :: rank,error,i,bad_dim
+    logical :: slab
+    character(len=80) :: reason
+
+    dataset_id=-1; file_space=-1; mem_space=-1
+    counts=0; extents=0; file_dims=0; offset=0
+    ready=.false.; exists=.false.; rank=-1; bad_dim=0
+    reason='dataset existence query failed'
     call H5Lexists_f(file_id,trim(dsetname),exists,error)
-    if(.not.exists) then
-      write(*,*) "WARNING: dataset ",dsetname," does not exists!"
+    if (error<0) goto 900
+    if (.not.exists) then
+      write(*,*) 'WARNING: dataset ',dsetname,' does not exists!'
       return
     endif
-    !*** initialisation ***
-    dims = [int(0,kind=HSIZE_T)]; if(allocated(array1D)) deallocate(array1D)
-    !*** get the dataset and dataspace ids ***
+    reason='dataset open failed'
     call H5Dopen_f(file_id,trim(dsetname),dataset_id,error)
-    if(error.ne.0) then
-      write(*,*) "WARNING: error in opening the dataset ",dsetname,"!"
-      return
-    endif
-    call H5Dget_space_f(dataset_id,dataspace_id,error)
-    !*** get the space rank ***
-    call H5Sget_simple_extent_ndims_f(dataspace_id,rank,error)
-    if(rank.eq.1) then
-      !*** get space size ***
-      call H5Sget_simple_extent_dims_f(dataspace_id,dims,maxdims,error)
-      if(present(reqdims_in).and.present(start)) then
-        !*** load a data slab of size reqdims and start start ***
-        !*** using default transfer properties ***
-        allocate(array1D(reqdims_in(1))); array1D = 0;
-        call H5Screate_simple_f(rank,reqdims_in,dataspace_req_id,error)
-        call H5Sselect_hyperslab_f(dataspace_id, H5S_SELECT_SET_F, &
-        start=start, count=shape(array1D,kind=HSIZE_T), hdferr=error)
-        call H5Dread_f(dataset_id,H5T_NATIVE_INTEGER,array1D,reqdims_in,error, &
-            file_space_id=dataspace_id, mem_space_id=dataspace_req_id)
-        call H5Sclose_f(dataspace_req_id,error)       
-      else
-        !*** allocate and read read the dataset ***
-        !*** using default transfer properties ***
-        allocate(array1D(dims(1))); array1D = 0;
-        call H5Dread_f(dataset_id,H5T_NATIVE_INTEGER,array1D,dims,error)
+    if (error<0) goto 900
+    reason='dataspace query failed'
+    call H5Dget_space_f(dataset_id,file_space,error)
+    if (error<0) goto 900
+    reason='dataset rank query failed'
+    call H5Sget_simple_extent_ndims_f(file_space,rank,error)
+    if (error<0) goto 900
+    reason='dataset rank does not match reader rank'
+    if (rank/=expected_rank) goto 900
+    reason='dataset extent query failed'
+    call H5Sget_simple_extent_dims_f(file_space,file_dims,max_dims,error)
+    if (error<0) goto 900
+    slab=present(reqdims_in).and.present(start)
+    if (slab) offset=start
+    do i=1,expected_rank
+      bad_dim=i
+      reason='file extent is negative or exceeds signed allocation range'
+      if (file_dims(i)<0.or.file_dims(i)>huge(extent)) goto 900
+      extent=int(file_dims(i),int64)
+      if (slab) then
+        ! Convert only after the signed request is known to fit. Negative
+        ! requests at ranks >= 2 are sentinels, never HDF5 extents/counts.
+        reason='requested count exceeds signed allocation range'
+        if (reqdims_in(i)>huge(requested)) goto 900
+        if (expected_rank>=2.and.reqdims_in(i)<=0) then
+          extent=int(file_dims(i),int64)
+        else
+          requested=int(reqdims_in(i),int64)
+          reason='negative count is not supported by the rank-1 reader'
+          if (requested<0) goto 900
+          extent=requested
+        endif
       endif
-    else
-      write(*,*) 'Read 1D allocatable integer array from HDF5, rank is not 1: skip!'
+      reason='offset is negative or beyond the file extent'
+      if (offset(i)<0.or.offset(i)>file_dims(i)) goto 900
+      reason='requested count exceeds the file extent after offset'
+      ! Subtract after checking offset; do not form the overflowing sum
+      ! offset+count. A full-dimension sentinel therefore requires start=0.
+      if (extent>file_dims(i)-offset(i)) goto 900
+      extents(i)=extent
+      counts(i)=int(extent,HSIZE_T)
+    enddo
+    bad_dim=0
+    ! Check the allocation byte count and signed HDF5 selected-point range.
+    ! Empty arrays still have their individual extents validated above.
+    points=0
+    if (all(extents>0)) then
+      points=1
+      do i=1,expected_rank
+        bad_dim=i
+        reason='selected element count overflows signed integer range'
+        if (points>huge(points)/extents(i)) goto 900
+        points=points*extents(i)
+      enddo
+      reason='allocation byte count or HDF5 point count overflows'
+      if (points>huge(points)/element_bytes.or.points>huge(file_points)) goto 900
     endif
-    !*** Closing ***
-    call H5Sclose_f(dataspace_id,error)
-    call H5Dclose_f(dataset_id,error)
+    bad_dim=0
+    reason='memory dataspace creation failed'
+    call H5Screate_simple_f(expected_rank,counts,mem_space,error)
+    if (error<0) goto 900
+    reason='file hyperslab selection failed'
+    if (points==0) then
+      call H5Sselect_none_f(file_space,error)
+      if (error<0) goto 900
+      call H5Sselect_none_f(mem_space,error)
+    else
+      call H5Sselect_hyperslab_f(file_space,H5S_SELECT_SET_F,start=offset,count=counts,hdferr=error)
+    endif
+    if (error<0) goto 900
+    reason='selected file/memory point count query failed'
+    call H5Sget_select_npoints_f(file_space,file_points,error)
+    if (error<0) goto 900
+    call H5Sget_select_npoints_f(mem_space,mem_points,error)
+    if (error<0) goto 900
+    reason='selected file and memory point counts do not match allocation'
+    if (file_points/=points.or.mem_points/=points) goto 900
+    ready=.true.
+    return
+900 continue
+    write(*,*) 'WARNING: HDF5 array read rejected: ',trim(dsetname),': ',trim(reason)
+    write(*,*) '  dataset rank / reader rank / failing dimension: ',rank,expected_rank,bad_dim
+    if (rank==expected_rank) write(*,*) '  file extents: ',file_dims
+    if (present(reqdims_in)) write(*,*) '  requested counts: ',reqdims_in
+    if (present(start)) write(*,*) '  requested offsets: ',start
+    write(*,*) '  normalized counts (zero for dimensions not yet validated): ',counts
+    call close_array_read(dataset_id,file_space,mem_space)
+  end subroutine prepare_array_read
+
+  subroutine close_array_read(dataset_id,file_space,mem_space)
+    integer(HID_T), intent(inout) :: dataset_id,file_space,mem_space
+    integer :: error
+    if (mem_space>=0) call H5Sclose_f(mem_space,error)
+    if (file_space>=0) call H5Sclose_f(file_space,error)
+    if (dataset_id>=0) call H5Dclose_f(dataset_id,error)
+    dataset_id=-1; file_space=-1; mem_space=-1
+  end subroutine close_array_read
+
+  subroutine HDF5_allocatable_array1D_reading_int(file_id,array1D,dsetname,reqdims_in,start)
+    integer(HID_T), intent(in) :: file_id
+    character(len=*), intent(in) :: dsetname
+    integer(HSIZE_T), optional, intent(in) :: reqdims_in(1),start(1)
+    integer, allocatable, intent(inout) :: array1D(:)
+    integer(HID_T) :: dataset_id,file_space,mem_space
+    integer(HSIZE_T) :: counts(1)
+    integer(int64) :: extents(1)
+    integer :: error
+    logical :: exists,ready
+
+    call prepare_array_read(file_id,dsetname,1,storage_size(0)/8,reqdims_in,start, &
+                            dataset_id,file_space,mem_space,counts,extents,exists,ready)
+    ! Preserve the existing missing-dataset behavior, including the caller's array.
+    if (.not.exists) return
+    if (allocated(array1D)) deallocate(array1D)
+    if (.not.ready) return
+    allocate(array1D(extents(1)),stat=error)
+    if (error==0) then
+      ! An empty independent read needs no transfer; retain its allocated shape.
+      if (all(extents>0)) then
+        array1D=0
+        call H5Dread_f(dataset_id,H5T_NATIVE_INTEGER,array1D,counts,error, &
+                       file_space_id=file_space,mem_space_id=mem_space)
+      endif
+    endif
+    if (error/=0) then
+      write(*,*) 'WARNING: HDF5 array allocation/read failed: ',dsetname,' extents=',extents,' status=',error
+      if (allocated(array1D)) deallocate(array1D)
+    endif
+    call close_array_read(dataset_id,file_space,mem_space)
   end subroutine HDF5_allocatable_array1D_reading_int
 
 
@@ -2546,67 +2657,36 @@ end subroutine HDF5_array1D_reading_char_len
   !   array2D:            (integer)(:,:)(allocatable) array of characters to be read from file
   !----------------------------------------  
   subroutine HDF5_allocatable_array2D_reading_int(file_id,array2D,dsetname,reqdims_in,start)
-    !> inputs:
-    integer(HID_T),intent(in)                         :: file_id    ! file identifier
-    character(len=*),intent(in)                       :: dsetname   ! dataset name
-    integer(HSIZE_T),dimension(2),intent(in),optional :: start      ! offset array to read
-    integer(HSIZE_T),dimension(2),intent(in),optional :: reqdims_in ! requested slab dimensions
-    !> inputs-outputs:
-    integer,dimension(:,:),allocatable,intent(inout) :: array2D
-    !> variables:
-    integer                        :: ii
-    integer(HID_T)                :: dataspace_id,dataspace_req_id ! dataspace identifier
-    integer(HID_T)                :: dataset_id ! dataset identifier
-    integer                       :: rank,error ! dataset rank and hdf5 error
-    integer(HSIZE_T),dimension(2) :: dims,maxdims,reqdims ! dataset dimensions
-    logical                       :: exists     ! true if dataset exists
-    !*** check if dataset exists otherwise return ***
-    call H5Lexists_f(file_id,trim(dsetname),exists,error)
-    if(.not.exists) then
-      write(*,*) "WARNING: dataset ",dsetname," does not exists!"
-      return
-    endif
-    !*** initialisation ***
-    dims = 0; if(allocated(array2D)) deallocate(array2D)
-    !*** get the dataset and dataspace ids ***
-    call H5Dopen_f(file_id,trim(dsetname),dataset_id,error)
-    if(error.ne.0) then
-      write(*,*) "WARNING: error in opening the dataset ",dsetname,"!"
-      return
-    endif
-    call H5dget_space_f(dataset_id,dataspace_id,error)
-    !*** get the space rank ***
-    call H5Sget_simple_extent_ndims_f(dataspace_id,rank,error)
-    if(rank.eq.2) then
-      !*** get space size ***
-      call H5Sget_simple_extent_dims_f(dataspace_id,dims,maxdims,error)
-      if(present(reqdims_in).and.present(start)) then
-        !> check validity of reqdims
-        reqdims = reqdims_in
-        do ii=1,rank
-          if(reqdims(ii).lt.1) reqdims(ii) = dims(ii)
-        enddo
-        !*** load a data slab of size reqdims and start start ***
-        !*** using default transfer properties ***
-        allocate(array2D(reqdims(1),reqdims(2))); array2D = 0;
-        call H5Screate_simple_f(rank,reqdims,dataspace_req_id,error)
-        call H5Sselect_hyperslab_f(dataspace_id, H5S_SELECT_SET_F, &
-        start=start, count=shape(array2D,kind=HSIZE_T), hdferr=error)
-        call H5Dread_f(dataset_id,H5T_NATIVE_INTEGER,array2D,reqdims,error, &
-            file_space_id=dataspace_id, mem_space_id=dataspace_req_id)
-        call H5Sclose_f(dataspace_req_id,error)       
-      else
-        !*** allocate and read read the dataset ***
-        !*** using default transfer properties ***
-        allocate(array2D(dims(1),dims(2))); array2D = 0;
-        call H5Dread_f(dataset_id,H5T_NATIVE_INTEGER,array2D,dims,error)
+    integer(HID_T), intent(in) :: file_id
+    character(len=*), intent(in) :: dsetname
+    integer(HSIZE_T), optional, intent(in) :: reqdims_in(2),start(2)
+    integer, allocatable, intent(inout) :: array2D(:,:)
+    integer(HID_T) :: dataset_id,file_space,mem_space
+    integer(HSIZE_T) :: counts(2)
+    integer(int64) :: extents(2)
+    integer :: error
+    logical :: exists,ready
+
+    call prepare_array_read(file_id,dsetname,2,storage_size(0)/8,reqdims_in,start, &
+                            dataset_id,file_space,mem_space,counts,extents,exists,ready)
+    ! Preserve the existing missing-dataset behavior, including the caller's array.
+    if (.not.exists) return
+    if (allocated(array2D)) deallocate(array2D)
+    if (.not.ready) return
+    allocate(array2D(extents(1),extents(2)),stat=error)
+    if (error==0) then
+      ! An empty independent read needs no transfer; retain its allocated shape.
+      if (all(extents>0)) then
+        array2D=0
+        call H5Dread_f(dataset_id,H5T_NATIVE_INTEGER,array2D,counts,error, &
+                       file_space_id=file_space,mem_space_id=mem_space)
       endif
-    else
-      write(*,*) 'Read 2D integer allocatable array from HDF5, rank is not 2: skip!'
     endif
-    !*** Closing ***
-    call H5Sclose_f(dataspace_id,error)
-    call H5Dclose_f(dataset_id,error)
+    if (error/=0) then
+      write(*,*) 'WARNING: HDF5 array allocation/read failed: ',dsetname,' extents=',extents,' status=',error
+      if (allocated(array2D)) deallocate(array2D)
+    endif
+    call close_array_read(dataset_id,file_space,mem_space)
   end subroutine HDF5_allocatable_array2D_reading_int
 
   !---------------------------------------- 
@@ -2880,61 +2960,36 @@ end subroutine HDF5_array1D_reading_char_len
   !   array1D:    (real4)(:)(allocatable) array of characters to be read from file
   !---------------------------------------- 
   subroutine HDF5_allocatable_array1D_reading_r4(file_id,array1D,dsetname,reqdims_in,start)
-    !> inputs:
-    integer(HID_T),intent(in)                         :: file_id    ! file identifier
-    character(len=*),intent(in)                       :: dsetname   ! dataset name
-    integer(HSIZE_T),dimension(1),intent(in),optional :: start      ! offset array to read
-    integer(HSIZE_T),dimension(1),intent(in),optional :: reqdims_in ! requested slab dimensions
-    !> inputs-outputs:
-    real*4,dimension(:),allocatable,intent(inout) :: array1D
-    !> variables:
-    integer(HID_T)                :: dataspace_id,dataspace_req_id ! dataspace identifier
-    integer(HID_T)                :: dataset_id   ! dataset identifier
-    integer                       :: rank,error   ! dataset rank and hdf5 error
-    integer(HSIZE_T),dimension(1) :: dims,maxdims ! dataset dimensions
-    logical                       :: exists       ! true if dataset exists
-    !*** check if dataset exists otherwise return ***
-    call H5Lexists_f(file_id,trim(dsetname),exists,error)
-    if(.not.exists) then
-      write(*,*) "WARNING: dataset ",dsetname," does not exists!"
-      return
-    endif
-    !*** initialisation ***
-    dims = 0; if(allocated(array1D)) deallocate(array1D)
-    !*** get the dataset and dataspace ids ***
-    call H5Dopen_f(file_id,trim(dsetname),dataset_id,error)
-    if(error.ne.0) then
-      write(*,*) "WARNING: error in opening the dataset ",dsetname,"!"
-      return
-    endif
-    call H5dget_space_f(dataset_id,dataspace_id,error)
-    !*** get the space rank ***
-    call H5Sget_simple_extent_ndims_f(dataspace_id,rank,error)
-    if(rank.eq.1) then
-      !*** get space size ***
-      call H5Sget_simple_extent_dims_f(dataspace_id,dims,maxdims,error)
-      if(present(reqdims_in).and.present(start)) then
-        !*** load a data slab of size reqdims and start start ***
-        !*** using default transfer properties ***
-        allocate(array1D(reqdims_in(1))); array1D = 0d0;
-        call H5Screate_simple_f(rank,reqdims_in,dataspace_req_id,error)
-        call H5Sselect_hyperslab_f(dataspace_id, H5S_SELECT_SET_F, &
-        start=start, count=shape(array1D,kind=HSIZE_T), hdferr=error)
-        call H5Dread_f(dataset_id,H5T_NATIVE_REAL,array1D,reqdims_in,error, &
-            file_space_id=dataspace_id, mem_space_id=dataspace_req_id)
-        call H5Sclose_f(dataspace_req_id,error)       
-      else
-        !*** allocate and read read the dataset ***
-        !*** using default transfer properties ***
-        allocate(array1D(dims(1))); array1D = 0d0;
-        call H5Dread_f(dataset_id,H5T_NATIVE_REAL,array1D,dims,error)
+    integer(HID_T), intent(in) :: file_id
+    character(len=*), intent(in) :: dsetname
+    integer(HSIZE_T), optional, intent(in) :: reqdims_in(1),start(1)
+    real*4, allocatable, intent(inout) :: array1D(:)
+    integer(HID_T) :: dataset_id,file_space,mem_space
+    integer(HSIZE_T) :: counts(1)
+    integer(int64) :: extents(1)
+    integer :: error
+    logical :: exists,ready
+
+    call prepare_array_read(file_id,dsetname,1,storage_size(0.0_4)/8,reqdims_in,start, &
+                            dataset_id,file_space,mem_space,counts,extents,exists,ready)
+    ! Preserve the existing missing-dataset behavior, including the caller's array.
+    if (.not.exists) return
+    if (allocated(array1D)) deallocate(array1D)
+    if (.not.ready) return
+    allocate(array1D(extents(1)),stat=error)
+    if (error==0) then
+      ! An empty independent read needs no transfer; retain its allocated shape.
+      if (all(extents>0)) then
+        array1D=0.0_4
+        call H5Dread_f(dataset_id,H5T_NATIVE_REAL,array1D,counts,error, &
+                       file_space_id=file_space,mem_space_id=mem_space)
       endif
-    else
-      write(*,*) 'Read 1D allocatable real4 array from HDF5, rank is not 1: skip!'
     endif
-    !*** Closing ***
-    call H5Sclose_f(dataspace_id,error)
-    call H5Dclose_f(dataset_id,error)
+    if (error/=0) then
+      write(*,*) 'WARNING: HDF5 array allocation/read failed: ',dsetname,' extents=',extents,' status=',error
+      if (allocated(array1D)) deallocate(array1D)
+    endif
+    call close_array_read(dataset_id,file_space,mem_space)
   end subroutine HDF5_allocatable_array1D_reading_r4
 
   !---------------------------------------- 
@@ -2954,61 +3009,36 @@ end subroutine HDF5_array1D_reading_char_len
   !   array1D:    (real8)(:)(allocatable) array of characters to be read from file
   !----------------------------------------  
   subroutine HDF5_allocatable_array1D_reading(file_id,array1D,dsetname,reqdims_in,start)
-    !> inputs:
-    integer(HID_T),intent(in)                         :: file_id    ! file identifier
-    character(len=*),intent(in)                       :: dsetname   ! dataset name
-    integer(HSIZE_T),dimension(1),intent(in),optional :: start      ! offset array to read
-    integer(HSIZE_T),dimension(1),intent(in),optional :: reqdims_in ! requested slab dimensions
-    !> inputs-outputs:
-    real*8,dimension(:),allocatable,intent(inout) :: array1D
-    !> variables:
-    integer(HID_T)                :: dataspace_id,dataspace_req_id ! dataspace identifier
-    integer(HID_T)                :: dataset_id   ! dataset identifier
-    integer                       :: rank,error   ! dataset rank and hdf5 error
-    integer(HSIZE_T),dimension(1) :: dims,maxdims ! dataset dimensions
-    logical                       :: exists       ! true if dataset exists
-    !*** check if dataset exists otherwise return ***
-    call H5Lexists_f(file_id,trim(dsetname),exists,error)
-    if(.not.exists) then
-      write(*,*) "WARNING: dataset ",dsetname," does not exists!"
-      return
-    endif
-    !*** initialisation ***
-    dims = 0; if(allocated(array1D)) deallocate(array1D)
-    !*** get the dataset and dataspace ids ***
-    call H5Dopen_f(file_id,trim(dsetname),dataset_id,error)
-    if(error.ne.0) then
-      write(*,*) "WARNING: error in opening the dataset ",dsetname,"!"
-      return
-    endif
-    call H5dget_space_f(dataset_id,dataspace_id,error)
-    !*** get the space rank ***
-    call H5Sget_simple_extent_ndims_f(dataspace_id,rank,error)
-    if(rank.eq.1) then
-      !*** get space size ***
-      call H5Sget_simple_extent_dims_f(dataspace_id,dims,maxdims,error)
-      if(present(reqdims_in).and.present(start)) then
-        !*** load a data slab of size reqdims and start start ***
-        !*** using default transfer properties ***
-        allocate(array1D(reqdims_in(1))); array1D = 0d0;
-        call H5Screate_simple_f(rank,reqdims_in,dataspace_req_id,error)
-        call H5Sselect_hyperslab_f(dataspace_id, H5S_SELECT_SET_F, &
-        start=start, count=shape(array1D,kind=HSIZE_T), hdferr=error)
-        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array1D,reqdims_in,error, &
-            file_space_id=dataspace_id, mem_space_id=dataspace_req_id)
-        call H5Sclose_f(dataspace_req_id,error)       
-      else
-        !*** allocate and read read the dataset ***
-        !*** using default transfer properties ***
-        allocate(array1D(dims(1))); array1D = 0d0;
-        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array1D,dims,error)
+    integer(HID_T), intent(in) :: file_id
+    character(len=*), intent(in) :: dsetname
+    integer(HSIZE_T), optional, intent(in) :: reqdims_in(1),start(1)
+    real*8, allocatable, intent(inout) :: array1D(:)
+    integer(HID_T) :: dataset_id,file_space,mem_space
+    integer(HSIZE_T) :: counts(1)
+    integer(int64) :: extents(1)
+    integer :: error
+    logical :: exists,ready
+
+    call prepare_array_read(file_id,dsetname,1,storage_size(0.0_8)/8,reqdims_in,start, &
+                            dataset_id,file_space,mem_space,counts,extents,exists,ready)
+    ! Preserve the existing missing-dataset behavior, including the caller's array.
+    if (.not.exists) return
+    if (allocated(array1D)) deallocate(array1D)
+    if (.not.ready) return
+    allocate(array1D(extents(1)),stat=error)
+    if (error==0) then
+      ! An empty independent read needs no transfer; retain its allocated shape.
+      if (all(extents>0)) then
+        array1D=0.0_8
+        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array1D,counts,error, &
+                       file_space_id=file_space,mem_space_id=mem_space)
       endif
-    else
-      write(*,*) 'Read 1D allocatable array from HDF5, rank is not 1: skip!'
     endif
-    !*** Closing ***
-    call H5Sclose_f(dataspace_id,error)
-    call H5Dclose_f(dataset_id,error)
+    if (error/=0) then
+      write(*,*) 'WARNING: HDF5 array allocation/read failed: ',dsetname,' extents=',extents,' status=',error
+      if (allocated(array1D)) deallocate(array1D)
+    endif
+    call close_array_read(dataset_id,file_space,mem_space)
   end subroutine HDF5_allocatable_array1D_reading
 
   !---------------------------------------- 
@@ -3089,67 +3119,36 @@ end subroutine HDF5_array1D_reading_char_len
   !   array2D:    (real4)(:,:)(allocatable) array of characters to be read from file
   !---------------------------------------- 
   subroutine HDF5_allocatable_array2D_reading(file_id,array2D,dsetname,reqdims_in,start)
-    !> inputs:
-    integer(HID_T),intent(in)                         :: file_id    ! file identifier
-    character(len=*),intent(in)                       :: dsetname   ! dataset name
-    integer(HSIZE_T),dimension(2),intent(in),optional :: start      ! offset array to read
-    integer(HSIZE_T),dimension(2),intent(in),optional :: reqdims_in ! requested slab dimensions
-    !> inputs-outputs:
-    real*8,dimension(:,:),allocatable,intent(inout) :: array2D
-    !> variables:
-    integer        :: ii
-    integer(HID_T) :: dataspace_id,dataspace_req_id ! dataspace identifier
-    integer(HID_T) :: dataset_id   ! dataset identifier
-    integer        :: rank,error   ! dataset rank and hdf5 error
-    integer(HSIZE_T),dimension(2) :: dims,maxdims,reqdims ! dataset dimensions
-    logical        :: exists       ! true if dataset exists
-    !*** check if dataset exists otherwise return ***
-    call H5Lexists_f(file_id,trim(dsetname),exists,error)
-    if(.not.exists) then
-      write(*,*) "WARNING: dataset ",dsetname," does not exists!"
-      return
-    endif
-    !*** initialisation ***
-    dims = 0; if(allocated(array2D)) deallocate(array2D)
-    !*** get the dataset and dataspace ids ***
-    call H5Dopen_f(file_id,trim(dsetname),dataset_id,error)
-    if(error.ne.0) then
-      write(*,*) "WARNING: error in opening the dataset ",dsetname,"!"
-      return
-    endif
-    call H5dget_space_f(dataset_id,dataspace_id,error)
-    !*** get the space rank ***
-    call H5Sget_simple_extent_ndims_f(dataspace_id,rank,error)
-    if(rank.eq.2) then
-      !*** get space size ***
-      call H5Sget_simple_extent_dims_f(dataspace_id,dims,maxdims,error)
-      if(present(reqdims_in).and.present(start)) then
-        !> check validity of reqdims
-        reqdims = reqdims_in
-        do ii=1,rank
-          if(reqdims(ii).lt.1) reqdims(ii) = dims(ii)
-        enddo
-        !*** load a data slab of size reqdims and start start ***
-        !*** using default transfer properties ***
-        allocate(array2D(reqdims(1),reqdims(2))); array2D = 0d0;
-        call H5Screate_simple_f(rank,reqdims,dataspace_req_id,error)
-        call H5Sselect_hyperslab_f(dataspace_id, H5S_SELECT_SET_F, &
-        start=start, count=shape(array2D,kind=HSIZE_T), hdferr=error)
-        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array2D,reqdims,error, &
-            file_space_id=dataspace_id, mem_space_id=dataspace_req_id)
-        call H5Sclose_f(dataspace_req_id,error)       
-      else
-        !*** allocate and read read the dataset ***
-        !*** using default transfer properties ***
-        allocate(array2D(dims(1),dims(2))); array2D = 0d0;
-        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array2D,dims,error)
+    integer(HID_T), intent(in) :: file_id
+    character(len=*), intent(in) :: dsetname
+    integer(HSIZE_T), optional, intent(in) :: reqdims_in(2),start(2)
+    real*8, allocatable, intent(inout) :: array2D(:,:)
+    integer(HID_T) :: dataset_id,file_space,mem_space
+    integer(HSIZE_T) :: counts(2)
+    integer(int64) :: extents(2)
+    integer :: error
+    logical :: exists,ready
+
+    call prepare_array_read(file_id,dsetname,2,storage_size(0.0_8)/8,reqdims_in,start, &
+                            dataset_id,file_space,mem_space,counts,extents,exists,ready)
+    ! Preserve the existing missing-dataset behavior, including the caller's array.
+    if (.not.exists) return
+    if (allocated(array2D)) deallocate(array2D)
+    if (.not.ready) return
+    allocate(array2D(extents(1),extents(2)),stat=error)
+    if (error==0) then
+      ! An empty independent read needs no transfer; retain its allocated shape.
+      if (all(extents>0)) then
+        array2D=0.0_8
+        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array2D,counts,error, &
+                       file_space_id=file_space,mem_space_id=mem_space)
       endif
-    else
-      write(*,*) 'Read 2D allocatable array from HDF5, rank is not 2: skip!'
     endif
-    !*** Closing ***
-    call H5Sclose_f(dataspace_id,error)
-    call H5Dclose_f(dataset_id,error)
+    if (error/=0) then
+      write(*,*) 'WARNING: HDF5 array allocation/read failed: ',dsetname,' extents=',extents,' status=',error
+      if (allocated(array2D)) deallocate(array2D)
+    endif
+    call close_array_read(dataset_id,file_space,mem_space)
   end subroutine HDF5_allocatable_array2D_reading
 
   !---------------------------------------- 
@@ -3235,67 +3234,36 @@ end subroutine HDF5_array1D_reading_char_len
   !   array3D:    (real8)(:,:,:)(allocatable) array of characters to be read from file
   !---------------------------------------- 
   subroutine HDF5_allocatable_array3D_reading(file_id,array3D,dsetname,reqdims_in,start)
-    !> inputs:
-    integer(HID_T),intent(in)                         :: file_id    ! file identifier
-    character(len=*),intent(in)                       :: dsetname   ! dataset name
-    integer(HSIZE_T),dimension(3),intent(in),optional :: start      ! offset array to read
-    integer(HSIZE_T),dimension(3),intent(in),optional :: reqdims_in ! requested slab dimensions
-    !> inputs-outputs:
-    real*8,dimension(:,:,:),allocatable,intent(inout) :: array3D
-    !> variables:
-    integer        :: ii
-    integer(HID_T) :: dataspace_id,dataspace_req_id ! dataspace identifier
-    integer(HID_T) :: dataset_id ! dataset identifier
-    integer        :: rank,error ! dataset rank and hdf5 error
-    integer(HSIZE_T),dimension(3) :: dims,maxdims,reqdims !< dataset dimensions
-    logical        :: exists     ! true if dataset exists
-    !*** check if dataset exists otherwise return ***
-    call H5Lexists_f(file_id,trim(dsetname),exists,error)
-    if(.not.exists) then
-      write(*,*) "WARNING: dataset ",dsetname," does not exists!"
-      return
-    endif
-    !*** initialisation ***
-    dims = 0; if(allocated(array3D)) deallocate(array3D)
-    !*** get the dataset and dataspace ids ***
-    call H5Dopen_f(file_id,trim(dsetname),dataset_id,error)
-    if(error.ne.0) then
-      write(*,*) "WARNING: error in opening the dataset ",dsetname,"!"
-      return
-    endif
-    call H5dget_space_f(dataset_id,dataspace_id,error)
-    !*** get the space rank ***
-    call H5Sget_simple_extent_ndims_f(dataspace_id,rank,error)
-    if(rank.eq.3) then
-      !*** get space size ***
-      call H5Sget_simple_extent_dims_f(dataspace_id,dims,maxdims,error)
-      if(present(reqdims_in).and.present(start)) then
-        !> check validity of reqdims
-        reqdims = reqdims_in
-        do ii=1,rank
-          if(reqdims(ii).lt.1) reqdims(ii) = dims(ii)
-        enddo
-        !*** load a data slab of size reqdims and start start ***
-        !*** using default transfer properties ***
-        allocate(array3D(reqdims(1),reqdims(2),reqdims(3))); array3D = 0d0;
-        call H5Screate_simple_f(rank,reqdims,dataspace_req_id,error)
-        call H5Sselect_hyperslab_f(dataspace_id, H5S_SELECT_SET_F, &
-        start=start, count=shape(array3D,kind=HSIZE_T), hdferr=error)
-        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array3D,reqdims,error, &
-            file_space_id=dataspace_id, mem_space_id=dataspace_req_id)
-        call H5Sclose_f(dataspace_req_id,error)       
-      else
-        !*** allocate and read read the dataset ***
-        !*** using default transfer properties ***
-        allocate(array3D(dims(1),dims(2),dims(3))); array3D = 0d0;
-        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array3D,dims,error)
+    integer(HID_T), intent(in) :: file_id
+    character(len=*), intent(in) :: dsetname
+    integer(HSIZE_T), optional, intent(in) :: reqdims_in(3),start(3)
+    real*8, allocatable, intent(inout) :: array3D(:,:,:)
+    integer(HID_T) :: dataset_id,file_space,mem_space
+    integer(HSIZE_T) :: counts(3)
+    integer(int64) :: extents(3)
+    integer :: error
+    logical :: exists,ready
+
+    call prepare_array_read(file_id,dsetname,3,storage_size(0.0_8)/8,reqdims_in,start, &
+                            dataset_id,file_space,mem_space,counts,extents,exists,ready)
+    ! Preserve the existing missing-dataset behavior, including the caller's array.
+    if (.not.exists) return
+    if (allocated(array3D)) deallocate(array3D)
+    if (.not.ready) return
+    allocate(array3D(extents(1),extents(2),extents(3)),stat=error)
+    if (error==0) then
+      ! An empty independent read needs no transfer; retain its allocated shape.
+      if (all(extents>0)) then
+        array3D=0.0_8
+        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array3D,counts,error, &
+                       file_space_id=file_space,mem_space_id=mem_space)
       endif
-    else
-      write(*,*) 'Read 3D allocatable array from HDF5, rank is not 3: skip!'
     endif
-    !*** Closing ***
-    call H5Sclose_f(dataspace_id,error)
-    call H5Dclose_f(dataset_id,error)
+    if (error/=0) then
+      write(*,*) 'WARNING: HDF5 array allocation/read failed: ',dsetname,' extents=',extents,' status=',error
+      if (allocated(array3D)) deallocate(array3D)
+    endif
+    call close_array_read(dataset_id,file_space,mem_space)
   end subroutine HDF5_allocatable_array3D_reading
 
   !---------------------------------------- 
@@ -3378,67 +3346,36 @@ end subroutine HDF5_array1D_reading_char_len
   !   array4D:    (real8)(:,:,:,:)(allocatable) array of characters to be read from file
   !---------------------------------------- 
   subroutine HDF5_allocatable_array4D_reading(file_id,array4D,dsetname,reqdims_in,start)
-    !> inputs:
-    integer(HID_T),intent(in)                         :: file_id    ! file identifier
-    character(len=*),intent(in)                       :: dsetname   ! dataset name
-    integer(HSIZE_T),dimension(4),intent(in),optional :: start      ! offset array to read
-    integer(HSIZE_T),dimension(4),intent(in),optional :: reqdims_in ! requested slab dimensions
-    !> inputs-outputs:
-    real*8,dimension(:,:,:,:),allocatable,intent(inout) :: array4D
-    !> variables:
-    integer        :: ii
-    integer(HID_T) :: dataspace_id,dataspace_req_id ! dataspace identifier
-    integer(HID_T) :: dataset_id ! dataset identifier
-    integer        :: rank,error ! dataset rank and hdf5 error
-    integer(HSIZE_T),dimension(4) :: dims,maxdims,reqdims ! dataset dimensions
-    logical        :: exists     ! true if dataset exists
-    !*** check if dataset exists otherwise return ***
-    call H5Lexists_f(file_id,trim(dsetname),exists,error)
-    if(.not.exists) then
-      write(*,*) "WARNING: dataset ",dsetname," does not exists!"
-      return
-    endif
-    !*** initialisation ***
-    dims = 0; if(allocated(array4D)) deallocate(array4D)
-    !*** get the dataset and dataspace ids ***
-    call H5Dopen_f(file_id,trim(dsetname),dataset_id,error)
-    if(error.ne.0) then
-      write(*,*) "WARNING: error in opening the dataset ",dsetname,"!"
-      return
-    endif
-    call H5dget_space_f(dataset_id,dataspace_id,error)
-    !*** get the space rank ***
-    call H5Sget_simple_extent_ndims_f(dataspace_id,rank,error)
-    if(rank.eq.4) then
-      !*** get space size ***
-      call H5Sget_simple_extent_dims_f(dataspace_id,dims,maxdims,error)
-      if(present(reqdims_in).and.present(start)) then
-        !> check validity of reqdims
-        reqdims = reqdims_in
-        do ii=1,rank
-          if(reqdims(ii).lt.1) reqdims(ii) = dims(ii)
-        enddo
-        !*** load a data slab of size reqdims and start start ***
-        !*** using default transfer properties ***
-        allocate(array4D(reqdims(1),reqdims(2),reqdims(3),reqdims(4))); array4D = 0d0;
-        call H5Screate_simple_f(rank,reqdims,dataspace_req_id,error)
-        call H5Sselect_hyperslab_f(dataspace_id, H5S_SELECT_SET_F, &
-        start=start, count=shape(array4D,kind=HSIZE_T), hdferr=error)
-        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array4D,reqdims,error, &
-            file_space_id=dataspace_id, mem_space_id=dataspace_req_id)
-        call H5Sclose_f(dataspace_req_id,error)       
-      else
-        !*** allocate and read read the dataset ***
-        !*** using default transfer properties ***
-        allocate(array4D(dims(1),dims(2),dims(3),dims(4))); array4D = 0d0;
-        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array4D,dims,error)
+    integer(HID_T), intent(in) :: file_id
+    character(len=*), intent(in) :: dsetname
+    integer(HSIZE_T), optional, intent(in) :: reqdims_in(4),start(4)
+    real*8, allocatable, intent(inout) :: array4D(:,:,:,:)
+    integer(HID_T) :: dataset_id,file_space,mem_space
+    integer(HSIZE_T) :: counts(4)
+    integer(int64) :: extents(4)
+    integer :: error
+    logical :: exists,ready
+
+    call prepare_array_read(file_id,dsetname,4,storage_size(0.0_8)/8,reqdims_in,start, &
+                            dataset_id,file_space,mem_space,counts,extents,exists,ready)
+    ! Preserve the existing missing-dataset behavior, including the caller's array.
+    if (.not.exists) return
+    if (allocated(array4D)) deallocate(array4D)
+    if (.not.ready) return
+    allocate(array4D(extents(1),extents(2),extents(3),extents(4)),stat=error)
+    if (error==0) then
+      ! An empty independent read needs no transfer; retain its allocated shape.
+      if (all(extents>0)) then
+        array4D=0.0_8
+        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array4D,counts,error, &
+                       file_space_id=file_space,mem_space_id=mem_space)
       endif
-    else
-      write(*,*) 'Read 4D allocatable array from HDF5, rank is not 4: skip!'
     endif
-    !*** Closing ***
-    call H5Sclose_f(dataspace_id,error)
-    call H5Dclose_f(dataset_id,error)
+    if (error/=0) then
+      write(*,*) 'WARNING: HDF5 array allocation/read failed: ',dsetname,' extents=',extents,' status=',error
+      if (allocated(array4D)) deallocate(array4D)
+    endif
+    call close_array_read(dataset_id,file_space,mem_space)
   end subroutine HDF5_allocatable_array4D_reading
 
   !---------------------------------------- 
@@ -3558,67 +3495,36 @@ end subroutine HDF5_array1D_reading_char_len
   !   array5D:    (real8)(:,:,:,:,:)(allocatable) array of characters to be read from file
   !----------------------------------------  
   subroutine HDF5_allocatable_array5D_reading(file_id,array5D,dsetname,reqdims_in,start)
-    !> inputs:
-    integer(HID_T),intent(in)                         :: file_id    ! file identifier
-    character(len=*),intent(in)                       :: dsetname   ! dataset name
-    integer(HSIZE_T),dimension(5),intent(in),optional :: start      ! offset array to read
-    integer(HSIZE_T),dimension(5),intent(in),optional :: reqdims_in ! requested slab dimensions
-    !> inputs-outputs:
-    real*8,dimension(:,:,:,:,:),allocatable,intent(inout) :: array5D
-    !> variables:
-    integer        :: ii
-    integer(HID_T) :: dataspace_id,dataspace_req_id ! dataspace identifier
-    integer(HID_T) :: dataset_id ! dataset identifier
-    integer        :: rank,error ! dataset rank and hdf5 error
-    integer(HSIZE_T),dimension(5) :: dims,maxdims,reqdims ! dataset dimensions
-    logical        :: exists     ! true if dataset exists
-    !*** check if dataset exists otherwise return ***
-    call H5Lexists_f(file_id,trim(dsetname),exists,error)
-    if(.not.exists) then
-      write(*,*) "WARNING: dataset ",dsetname," does not exists!"
-      return
-    endif
-    !*** initialisation ***
-    dims = 0; if(allocated(array5D)) deallocate(array5D)
-    !*** get the dataset and dataspace ids ***
-    call H5Dopen_f(file_id,trim(dsetname),dataset_id,error)
-    if(error.ne.0) then
-      write(*,*) "WARNING: error in opening the dataset ",dsetname,"!"
-      return
-    endif
-    call H5dget_space_f(dataset_id,dataspace_id,error)
-    !*** get the space rank ***
-    call H5Sget_simple_extent_ndims_f(dataspace_id,rank,error)
-    if(rank.eq.5) then
-      !*** get space size ***
-      call H5Sget_simple_extent_dims_f(dataspace_id,dims,maxdims,error)
-      if(present(reqdims_in).and.present(start)) then
-        reqdims = reqdims_in
-        !> check validity of reqdims
-        do ii=1,rank
-          if(reqdims(ii).lt.1) reqdims(ii) = dims(ii)
-        enddo
-        !*** load a data slab of size reqdims and start start ***
-        !*** using default transfer properties ***
-        allocate(array5D(reqdims(1),reqdims(2),reqdims(3),reqdims(4),reqdims(5))); 
-        array5D = 0d0; call H5Screate_simple_f(rank,reqdims,dataspace_req_id,error)
-        call H5Sselect_hyperslab_f(dataspace_id, H5S_SELECT_SET_F, &
-        start=start, count=shape(array5D,kind=HSIZE_T), hdferr=error)
-        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array5D,reqdims,error, &
-            file_space_id=dataspace_id, mem_space_id=dataspace_req_id)
-        call H5Sclose_f(dataspace_req_id,error)       
-      else
-        !*** allocate and read read the dataset ***
-        !*** using default transfer properties ***
-        allocate(array5D(dims(1),dims(2),dims(3),dims(4),dims(5))); array5D = 0d0;
-        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array5D,dims,error)
+    integer(HID_T), intent(in) :: file_id
+    character(len=*), intent(in) :: dsetname
+    integer(HSIZE_T), optional, intent(in) :: reqdims_in(5),start(5)
+    real*8, allocatable, intent(inout) :: array5D(:,:,:,:,:)
+    integer(HID_T) :: dataset_id,file_space,mem_space
+    integer(HSIZE_T) :: counts(5)
+    integer(int64) :: extents(5)
+    integer :: error
+    logical :: exists,ready
+
+    call prepare_array_read(file_id,dsetname,5,storage_size(0.0_8)/8,reqdims_in,start, &
+                            dataset_id,file_space,mem_space,counts,extents,exists,ready)
+    ! Preserve the existing missing-dataset behavior, including the caller's array.
+    if (.not.exists) return
+    if (allocated(array5D)) deallocate(array5D)
+    if (.not.ready) return
+    allocate(array5D(extents(1),extents(2),extents(3),extents(4),extents(5)),stat=error)
+    if (error==0) then
+      ! An empty independent read needs no transfer; retain its allocated shape.
+      if (all(extents>0)) then
+        array5D=0.0_8
+        call H5Dread_f(dataset_id,H5T_NATIVE_DOUBLE,array5D,counts,error, &
+                       file_space_id=file_space,mem_space_id=mem_space)
       endif
-    else
-      write(*,*) 'Read 5D allocatable array from HDF5, rank is not 5: skip!'
     endif
-    !*** Closing ***
-    call H5Sclose_f(dataspace_id,error)
-    call H5Dclose_f(dataset_id,error)
+    if (error/=0) then
+      write(*,*) 'WARNING: HDF5 array allocation/read failed: ',dsetname,' extents=',extents,' status=',error
+      if (allocated(array5D)) deallocate(array5D)
+    endif
+    call close_array_read(dataset_id,file_space,mem_space)
   end subroutine HDF5_allocatable_array5D_reading
 
   !----------------------------------------
