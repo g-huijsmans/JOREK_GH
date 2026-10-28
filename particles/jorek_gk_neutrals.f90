@@ -334,6 +334,12 @@ project_profiles = new_projection(sim%fields%node_list, sim%fields%element_list,
                       do_dirichlet =.false.,                                                                             &
                       fractional_digits = 9, calc_integrals=.false., to_vtk=.true., to_h5=.true., basename='profiles', nsub=5)
 
+! Keep charged components 1:6 unchanged; append diagnostic neutral density last.
+if (neutral_group <= size(sim%groups)) then
+  if (allocated(sim%groups(neutral_group)%particles)) &
+    project_profiles%f = [project_profiles%f, proj_f(proj_one, group=neutral_group)]
+endif
+
 call with(sim, project_profiles)
 call project_profiles%set_vtk_active(.false.)
 
