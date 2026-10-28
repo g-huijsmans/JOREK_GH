@@ -19,7 +19,7 @@ real*8 :: vacuum_fraction, b_over_a, a_over_b
 integer :: ierr,err,i
 
 ! --- Namelist with input parameters.
-namelist /in1/  tstep, nstep, tstep_n, nstep_n,                     &
+namelist /in1/  reflect_gk_neutrals, tstep, nstep, tstep_n, nstep_n,                     &
                 rst_hdf5, rst_hdf5_version, keep_current_prof,      &
                 eta, visco, visco_par, visco_par_par,               &
                 restart, rst_format, regrid, bootstrap, write_ps,   &

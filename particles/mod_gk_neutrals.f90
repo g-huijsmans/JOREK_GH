@@ -9,12 +9,15 @@ implicit none
 private
 public :: gk_neutral_state, initialize_gk_neutrals, advance_gk_neutrals
 public :: report_gk_neutral_diagnostics, push_gk_neutral_ballistic
+public :: get_gk_neutral_events, consume_gk_neutral_events
 
 type :: gk_neutral_state
-  private
-  integer :: group_num = 0, lost_count = 0
-  logical :: enabled = .false.
-  real*8 :: lost_weight = 0.d0, lost_energy = 0.d0
+  integer, private :: group_num = 0, lost_count = 0
+  logical, private :: enabled = .false.
+  real*8, private :: lost_weight = 0.d0, lost_energy = 0.d0
+  ! Transient rank-local events, never serialized or placed in a free-slot pool.
+  integer, allocatable :: newly_lost_indices(:)
+  integer :: n_newly_lost_indices = 0
 end type gk_neutral_state
 
 contains
@@ -44,6 +47,7 @@ subroutine initialize_gk_neutrals(sim, neutral_group, neutrals)
                ': expected particle_kinetic_leapfrog'
     call MPI_ABORT(MPI_COMM_WORLD, 1, ierr)
   end select
+  allocate(neutrals%newly_lost_indices(size(sim%groups(g)%particles)),source=0)
   if (sim%my_id == 0) write(*,*) 'Stage A neutral group ', g, ' ID ', sim%groups(g)%id, &
                                 ': particle_kinetic_leapfrog, active charges validated q=0'
 end subroutine initialize_gk_neutrals
@@ -103,6 +107,12 @@ subroutine advance_gk_neutrals(sim, neutrals, dt, nsubsteps)
   neutrals%lost_weight = 0.d0
   neutrals%lost_energy = 0.d0
   g = neutrals%group_num
+  neutrals%n_newly_lost_indices=0
+  if (allocated(neutrals%newly_lost_indices)) then
+    if (size(neutrals%newly_lost_indices)/=size(sim%groups(g)%particles)) deallocate(neutrals%newly_lost_indices)
+  endif
+  if (.not.allocated(neutrals%newly_lost_indices)) &
+    allocate(neutrals%newly_lost_indices(size(sim%groups(g)%particles)),source=0)
   ! Also catches a previously free slot activated with an invalid charge.
   call validate_neutral_charges(sim, g)
   select type (p => sim%groups(g)%particles)
@@ -119,6 +129,10 @@ subroutine advance_gk_neutrals(sim, neutrals, dt, nsubsteps)
              p(j)%x(1), p(j)%x(2), p(j)%st(1), p(j)%st(2), p(j)%i_elm, ifail, phi=p(j)%x(3))
         ! Keep the locator's negative boundary-element index and boundary st.
         if (p(j)%i_elm <= 0) then
+          if (p(j)%i_elm<0) then
+            neutrals%n_newly_lost_indices=neutrals%n_newly_lost_indices+1
+            neutrals%newly_lost_indices(neutrals%n_newly_lost_indices)=j
+          endif
           neutrals%lost_count = neutrals%lost_count + 1
           neutrals%lost_weight = neutrals%lost_weight + p(j)%weight
           neutrals%lost_energy = neutrals%lost_energy + &
@@ -129,6 +143,32 @@ subroutine advance_gk_neutrals(sim, neutrals, dt, nsubsteps)
     enddo
   end select
 end subroutine advance_gk_neutrals
+
+!> Read-only event snapshot: allocation is proportional to events, not all slots.
+!> Only event buffer/count are public for inspection; other passive state stays private.
+subroutine get_gk_neutral_events(neutrals,indices,group,ierr)
+  type(gk_neutral_state), intent(in) :: neutrals
+  integer, allocatable, intent(out) :: indices(:)
+  integer, intent(out) :: group,ierr
+  integer :: n
+  group=neutrals%group_num; ierr=1; n=neutrals%n_newly_lost_indices
+  if(n<0) return
+  if(.not.allocated(neutrals%newly_lost_indices)) then
+    if(n/=0) return
+  else
+    if(n>size(neutrals%newly_lost_indices)) return
+  endif
+  allocate(indices(n))
+  if(n>0) indices=neutrals%newly_lost_indices(:n)
+  ierr=0
+end subroutine
+
+!> Consume only after global success. Scalar loss diagnostics remain wall crossings
+!> before reflection, even when those markers are now active again.
+subroutine consume_gk_neutral_events(neutrals)
+  type(gk_neutral_state), intent(inout) :: neutrals
+  neutrals%n_newly_lost_indices=0
+end subroutine
 
 !> Global active totals and losses during the most recent outer step; energy in J.
 subroutine report_gk_neutral_diagnostics(sim, neutrals)

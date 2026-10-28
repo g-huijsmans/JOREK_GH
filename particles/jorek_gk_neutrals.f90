@@ -12,6 +12,9 @@ use mod_particle_sim
 use mod_particle_slot_pool
 use mod_gk_neutral_recycling, only: gk_neutral_recycling_state, initialize_gk_neutral_recycling, &
                                     recycle_lost_gk_ions, report_gk_neutral_recycling
+use mod_gk_neutral_reflection, only: gk_neutral_reflection_state, initialize_gk_neutral_reflection, &
+                                     reflect_newly_lost_gk_neutrals, report_gk_neutral_reflection
+use phys_module, only: reflect_gk_neutrals
 use mod_gk_neutrals, only: gk_neutral_state, initialize_gk_neutrals, advance_gk_neutrals, &
                            report_gk_neutral_diagnostics
 use mod_particle_allocation, only: allocate_particles_for_sim
@@ -87,6 +90,7 @@ type(particle_slot_registry) :: slot_registry
 integer, allocatable :: slot_groups(:)
 logical, parameter :: debug_slot_pools=.false.
 type(gk_neutral_state) :: neutrals
+type(gk_neutral_reflection_state) :: reflection
 type(gk_neutral_recycling_state) :: recycling
 
 logical :: update_electric_potential ! move to input?
@@ -311,6 +315,9 @@ n_newly_lost_ions=0; n_newly_lost_electrons=0
 call check_debug_pools()
 
 call initialize_gk_neutrals(sim, neutral_group, neutrals)
+! This dedicated-main option is outside the historical common broadcast buffer.
+call MPI_BCAST(reflect_gk_neutrals, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
+call initialize_gk_neutral_reflection(sim, neutral_group, reflect_gk_neutrals, reflection)
 call initialize_gk_neutral_recycling(sim, ion_group, neutral_group, recycling)
 call report_gk_neutral_diagnostics(sim, neutrals)
 
@@ -567,6 +574,7 @@ do i=1, nstep_particles
 
   ! Charged loss diagnostics are complete. New products first move next outer step.
   call advance_gk_neutrals(sim, neutrals, tstep_particles, nsubstep_particles)
+  call reflect_newly_lost_gk_neutrals(sim, neutrals, reflection, sim%time, tstep_particles)
   call recycle_lost_gk_ions(sim, recycling, slot_registry, sim%time, tstep_particles)
   call finalize_lost_electrons()
   call check_debug_pools()
@@ -631,6 +639,7 @@ do i=1, nstep_particles
 
   if (mod(index_now,nout).eq. 0) then
     call report_gk_neutral_diagnostics(sim, neutrals)
+    call report_gk_neutral_reflection(sim, reflection)
     call report_gk_neutral_recycling(sim, recycling)
     call project_profiles%set_vtk_active(.true.)
     call with(sim, project_profiles)
