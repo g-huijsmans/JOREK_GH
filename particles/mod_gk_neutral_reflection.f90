@@ -5,11 +5,13 @@ use mpi
 use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
 use mod_particle_sim, only: particle_sim
 use mod_particle_types, only: particle_kinetic_leapfrog
-use mod_gk_neutrals, only: gk_neutral_state, get_gk_neutral_events, consume_gk_neutral_events
+use mod_gk_neutrals, only: gk_neutral_state, gk_neutral_event, get_gk_neutral_events, &
+                           consume_gk_neutral_events, push_gk_neutral_ballistic
+use mod_gk_neutral_trajectory, only: verify_neutral_trajectory, side_correction, boundary_sides, WALL_CROSSING
 use mod_pcg32_rng, only: pcg32_rng
 use mod_random_seed, only: random_seed
 use mod_sampling, only: sample_cosine
-use mod_boundary, only: wall_normal_vector
+use mod_boundary, only: wall_normal_vector, get_st_on_bnd
 use mod_interp, only: interp_RZ
 use constants, only: ATOMIC_MASS_UNIT
 implicit none
@@ -25,6 +27,7 @@ type :: gk_neutral_reflection_state
   ! Failed attempts are diagnosed, but their staged counters cannot be committed:
   ! optional-ierr rollback preserves ALL diagnostics, including failure counters.
   integer :: counts(7)=0, global_counts(7)=0
+  integer :: trajectory_count=0, global_trajectory_count=0
   ! Incident/reflected weight and incident/reflected translational energy [J].
   real*8 :: totals(4)=0.d0, global_totals(4)=0.d0
 end type
@@ -142,17 +145,19 @@ subroutine reflect_newly_lost_gk_neutrals(sim,neutrals,state,impact_time,dt,ierr
   type(gk_neutral_reflection_state) :: staged
   type(particle_kinetic_leapfrog), allocatable :: products(:)
   integer, allocatable :: indices(:)
-  integer :: group,local_error,error,k
+  type(gk_neutral_event), allocatable :: events(:)
+  type(side_correction), allocatable :: corrections(:)
+  integer :: group,local_error,error,k,h,neighbour
   if(present(ierr)) ierr=0
   if(.not.state%enabled) return
-  call get_gk_neutral_events(neutrals,indices,group,local_error)
+  call get_gk_neutral_events(neutrals,indices,group,local_error,events)
   if(local_error/=0) then
     call reject(sim,state%neutral_group,0,'invalid passive event buffer/count')
   else if(group/=state%neutral_group.or..not.state%initialized) then
     call reject(sim,state%neutral_group,0,'uninitialized state or event group mismatch')
     local_error=1
   else
-    call stage_reflection(sim,state,indices,impact_time,dt,products,staged,local_error)
+    call stage_reflection(sim,state,indices,events,impact_time,dt,products,corrections,staged,local_error)
   endif
   call vote(local_error,error,ierr)
   if(error/=0) return
@@ -164,32 +169,38 @@ subroutine reflect_newly_lost_gk_neutrals(sim,neutrals,state,impact_time,dt,ierr
   end select
   state=staged
   call consume_gk_neutral_events(neutrals)
+  do k=1,size(indices)
+    if(.not.corrections(k)%corrected) cycle
+    write(*,*) 'GK reflection trajectory correction rank/marker/element=',sim%my_id,indices(k),products(k)%i_elm, &
+      ' original element=',corrections(k)%original_element
+    write(*,*) ' selected/corrected sides=',corrections(k)%original_side,corrections(k)%side
+    write(*,*) ' original/corrected st=',corrections(k)%original_st,corrections(k)%st, &
+      ' original/impact vn=',corrections(k)%original_vn,corrections(k)%vn
+    write(*,*) ' lambda/wall RZ=',corrections(k)%lambda,corrections(k)%wall, &
+      ' local faces examined/nonexit roots/outside substep/faces without exit=', &
+      corrections(k)%examined,corrections(k)%nonexit,corrections(k)%outside,corrections(k)%no_exit
+    do h=1,corrections(k)%n_trace
+      neighbour=sim%fields%element_list%element(corrections(k)%trace_elements(h))%neighbours(corrections(k)%trace_faces(h))
+      write(*,*) ' verified exit element/face/lambda/physical/neighbour=',corrections(k)%trace_elements(h), &
+        corrections(k)%trace_faces(h),corrections(k)%trace_fractions(h),neighbour==0,neighbour
+    enddo
+  enddo
 end subroutine
 
-! Adjacent boundary-node criterion shared in convention with boundary_from_grid.
-function boundary_sides(sim,e) result(sides)
-  class(particle_sim), intent(in) :: sim
-  integer, intent(in) :: e
-  logical :: sides(4)
-  integer :: side,n1,n2
-  do side=1,4
-    n1=sim%fields%element_list%element(e)%vertex(side)
-    n2=sim%fields%element_list%element(e)%vertex(mod(side,4)+1)
-    sides(side)=sim%fields%node_list%node(n1)%boundary>0.and.sim%fields%node_list%node(n2)%boundary>0
-  enddo
-end function
-
-subroutine stage_reflection(sim,state,indices,impact_time,dt,products,staged,error)
+subroutine stage_reflection(sim,state,indices,events,impact_time,dt,products,corrections,staged,error)
   class(particle_sim), intent(in) :: sim
   type(gk_neutral_reflection_state), intent(in) :: state
   integer, intent(in) :: indices(:)
+  type(gk_neutral_event), intent(in) :: events(:)
+  type(side_correction), allocatable, intent(out) :: corrections(:)
   real*8, intent(in) :: impact_time,dt
   type(particle_kinetic_leapfrog), allocatable, intent(out) :: products(:)
   type(gk_neutral_reflection_state), intent(out) :: staged
   integer, intent(out) :: error
-  integer :: g,n,j,k,e,side,nsides
+  integer :: g,n,j,k,e,side,nsides,correction_error
   real*8, allocatable :: normals(:,:),speed2(:),energy(:)
   real*8 :: distances(4),r,rs,rt,z,zs,zt,jac,tangent,normal(3),speed,vn,u(2),direction(3),emitted
+  real*8 :: corrected_st(2)
   logical :: sides(4),allowed(4),ordered
   character(len=160) :: message
   staged=state; g=state%neutral_group; n=size(indices); j=0
@@ -198,7 +209,7 @@ subroutine stage_reflection(sim,state,indices,impact_time,dt,products,staged,err
   error=1
   message='nonfinite time or nonpositive/nonfinite substep'
   if(.not.ieee_is_finite(impact_time).or..not.ieee_is_finite(dt).or.dt<=0.d0) goto 900
-  allocate(products(n),normals(3,n),speed2(n),energy(n))
+  allocate(products(n),normals(3,n),speed2(n),energy(n),corrections(n))
   ! The passive producer emits increasing indices. Only a malformed/unordered
   ! supplied list needs the fallback duplicate check; neither path scans slots.
   ordered=.true.
@@ -225,7 +236,7 @@ subroutine stage_reflection(sim,state,indices,impact_time,dt,products,staged,err
       message='nonfinite retained position, st, or incident velocity'
       if(.not.all(ieee_is_finite(p(j)%x)).or..not.all(ieee_is_finite(p(j)%st)).or. &
          .not.all(ieee_is_finite(p(j)%v))) goto 900
-      sides=boundary_sides(sim,e)
+      sides=boundary_sides(sim%fields%node_list,sim%fields%element_list,e)
       nsides=count(sides)
       message='unresolved non-boundary last element; reduce the particle timestep (no trajectory backtracking)'
       if(nsides==0) goto 900
@@ -254,13 +265,26 @@ subroutine stage_reflection(sim,state,indices,impact_time,dt,products,staged,err
       if(.not.ieee_is_finite(energy(k))) goto 900
       speed=sqrt(speed2(k)); vn=dot_product(p(j)%v,normals(:,k))
       message='materially inward incident velocity at a negative wall crossing'
-      if(vn>roundoff_tolerance*speed) goto 900
+      corrected_st=p(j)%st
+      if(vn>roundoff_tolerance*speed) then
+        call trace_wall_crossing(sim,j,events(k),p(j),dt,corrections(k),correction_error)
+        if(correction_error/=0) goto 900
+        corrections(k)%original_element=e; corrections(k)%original_side=side
+        e=corrections(k)%element; nsides=count(boundary_sides(sim%fields%node_list,sim%fields%element_list,e))
+        corrections(k)%original_vn=vn
+        normals(:,k)=corrections(k)%normal; corrected_st=corrections(k)%st
+        r=corrections(k)%wall(1); z=corrections(k)%wall(2); vn=corrections(k)%vn
+        message='cumulative trajectory-correction counter would overflow'
+        if(staged%trajectory_count==huge(0)) goto 900
+        staged%trajectory_count=staged%trajectory_count+1
+      endif
       message='cumulative reflection counter would overflow'
       if(any(staged%counts==huge(0))) goto 900
       if(abs(vn)<=roundoff_tolerance*speed) staged%counts(3)=staged%counts(3)+1
       if(nsides>1) staged%counts(5)=staged%counts(5)+1
       products(k)=p(j)
       products(k)%i_elm=e
+      products(k)%st=corrected_st
       ! The locator has no exact impact phi: retain continuous end-of-substep phi.
       products(k)%x(1:2)=[r,z]
       staged%counts(1:2)=staged%counts(1:2)+1
@@ -299,6 +323,26 @@ subroutine stage_reflection(sim,state,indices,impact_time,dt,products,staged,err
   endif
 end subroutine
 
+!> Adapt saved reflection provenance to the shared geometry-only verifier.
+subroutine trace_wall_crossing(sim,j,event,endpoint,dt,hit,error)
+  class(particle_sim), intent(in) :: sim
+  integer, intent(in) :: j
+  type(gk_neutral_event), intent(in) :: event
+  type(particle_kinetic_leapfrog), intent(in) :: endpoint
+  real*8, intent(in) :: dt
+  type(side_correction), intent(out) :: hit
+  integer, intent(out) :: error
+  error=1
+  hit%reason='missing or mismatched pre-substep event record'
+  if(event%marker==j.and.event%substep>0.and.event%dt==dt) then
+    call verify_neutral_trajectory(sim%fields%node_list,sim%fields%element_list,event%element, &
+      event%st_old,event%x_old,event%v_old,dt,hit,endpoint%x,endpoint%v)
+    hit%original_st=endpoint%st
+    if(hit%status==WALL_CROSSING) error=0
+  endif
+  if(error/=0) write(*,*) 'GK reflection trajectory rank/marker/status/reason=',sim%my_id,j,hit%status,trim(hit%reason)
+end subroutine
+
 !> Cumulative local totals never reset or replaced by a reduced buffer.
 subroutine report_gk_neutral_reflection(sim,state)
   class(particle_sim), intent(in) :: sim
@@ -307,9 +351,11 @@ subroutine report_gk_neutral_reflection(sim,state)
   if(.not.state%enabled) return
   call MPI_ALLREDUCE(state%counts,state%global_counts,7,MPI_INTEGER,MPI_SUM,MPI_COMM_WORLD,error)
   call MPI_ALLREDUCE(state%totals,state%global_totals,4,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,error)
+  call MPI_ALLREDUCE(state%trajectory_count,state%global_trajectory_count,1,MPI_INTEGER,MPI_SUM,MPI_COMM_WORLD,error)
   if(sim%my_id==0) then
     write(*,*) 'GK reflection cumulative incident/reflected/grazing/unresolved/multiple/corner/failed=',state%global_counts
     write(*,*) 'GK reflection incident/reflected weight, incident/reflected energy_J=',state%global_totals
+    write(*,*) 'GK reflection cumulative wall-trajectory corrections=',state%global_trajectory_count
     write(*,*) 'Passive newly_lost diagnostics count wall crossings BEFORE reflection; no energy deposited at wall.'
   endif
 end subroutine

@@ -136,7 +136,7 @@ psi_n_end   = 1.5d0
 
 update_electric_potential = .true.
 
-zero_fraction        = 0.d0 ! create some space for new heating and fuelling particles
+zero_fraction        = 0.1d0 ! create some space for new heating and fuelling particles
 
 n_particles_out      = 500   ! in steps
 n_update_density     = 999999
@@ -469,8 +469,6 @@ do i=1, nstep_particles
 
  ! call empty_reservoir(sim, project_density, project_profiles, 1, 1, reservoir_E_ions,      reservoir_P_ions,      patch_list, n_patches)
  ! call empty_reservoir(sim, project_density, project_profiles, 1, 2, reservoir_E_electrons, reservoir_P_electrons, patch_list, n_patches)
-
-  write(*,*) sim%my_id, ' nsubstep_electrons, t_step_electrons : ',nsubstep_electrons
 
   tstep_electrons = tstep_particles / nsubstep_electrons
 

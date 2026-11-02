@@ -86,7 +86,8 @@ subroutine test_mesh_and_restart()
   type(gk_neutral_state) :: state, no_neutrals
   type(particle_kinetic_leapfrog) :: initial, saved, lost, snapshot(3)
   real*8 :: dummy1,dummy2,r,z,rs,rt,zs,zt,x0(3),v0(3),x(3),v(3)
-  integer :: ierr,g,j,unit
+  integer :: ierr,g,j,unit,physical_losses
+  real*8 :: loss_weight,loss_energy
   character(len=160) :: restart_file
   character(len=80) :: label
   call init_node_list(nodes,n_nodes_max,nodes%n_dof,n_var)
@@ -154,6 +155,13 @@ subroutine test_mesh_and_restart()
   end select
   call initialize_gk_neutrals(sim,neutral_group,state)
   call advance_gk_neutrals(sim,state,0.01d0,3)
+  call get_gk_neutral_loss_totals(state,physical_losses,loss_weight,loss_energy)
+  call assert_equals(merge(1,0,owns_marker(2)),physical_losses,'verified physical loss count')
+  call assert_equals(physical_losses,state%verified_wall_count,'one verified genuine wall event')
+  call assert_equals(0,state%recovered_count,'ordinary physical loss is not a recovery')
+  call assert_equals(0,state%unresolved_count,'ordinary loss resolves geometrically')
+  call assert_equals(merge(3.d13,0.d0,owns_marker(2)),loss_weight,0.d0,'physical loss weight')
+  if(.not.owns_marker(2)) call assert_equals(0.d0,loss_energy,0.d0,'no local loss energy')
   sim%time=0.03d0
   call report_gk_neutral_diagnostics(sim,state)
   if (owns_marker(1)) call cartesian(initial,x0,v0)
