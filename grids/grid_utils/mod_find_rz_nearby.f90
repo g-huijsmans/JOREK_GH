@@ -39,7 +39,7 @@ contains
 !! In that case, ifail=2:5 is returned.
 !! If ifail=-1 the particle is lost
 subroutine find_RZ_nearby(node_list, element_list, R_old, Z_old, s_old, t_old, i_elm_old, &
-        R_new, Z_new, s_new, t_new, i_elm_new, ifail, phi)
+        R_new, Z_new, s_new, t_new, i_elm_new, ifail, phi, iteration_limit)
 use data_structure
 use mod_neighbours
 use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
@@ -57,13 +57,20 @@ integer,                  intent(out)   :: i_elm_new
 integer,                  intent(out)   :: ifail !< if ifail = -1 the position could not be found in the grid.
 !< ifail > 0 indicates various other cases
 real*8, optional,         intent(in)    :: phi
+! Per-call override permits thread-safe exceptional retries; the global default
+! and all callers that omit it retain their original iteration budget.
+integer, optional, intent(in) :: iteration_limit
 
 !> Internal variables
 real*8  :: p              
+integer :: max_iterations
 integer :: newton_iter_number, i_elm_tmp, checked_elms
 real*8  :: inv_st_jac_det, R_s, R_t, Z_s, Z_t
 real*8  :: st_step(2), x_step(2), x_tmp(2), st_new(2), x_new(2) ! x_step = (R,Z) of trial position
 real*8  :: err2, err2_old, dist(2), fact
+
+max_iterations=find_RZ_nearby_iter
+if(present(iteration_limit))max_iterations=max(1,iteration_limit)
 
 if (present(phi)) then
   p = phi
@@ -98,7 +105,7 @@ ifail=0
 
 
 ! Newton iteration to find s and t in or out of this element
-do newton_iter_number = 1, find_RZ_nearby_iter
+do newton_iter_number = 1, max_iterations
   ! Perform newton iteration by calculating the inverse of the jacobian matrix explicitly
   err2_old = err2
 
@@ -169,7 +176,7 @@ if (ieee_is_nan(err2)) then
 if (ifail .eq. 0) ifail=2
 return
 endif
-if (newton_iter_number .gt. find_RZ_nearby_iter) then
+if (newton_iter_number .gt. max_iterations) then
 #if STELLARATOR_MODEL
   call find_RZP(node_list,element_list,x_new(1),x_new(2),p,x_step(1),x_step(2),i_elm_new,s_new,t_new,ifail, checked_elms)
 #else

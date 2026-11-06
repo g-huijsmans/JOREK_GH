@@ -10,11 +10,14 @@ program jorek_gk_neutrals
 use mod_particle_types
 use mod_particle_sim
 use mod_particle_slot_pool
+use mod_gk_adas_ionization
 use mod_gk_neutral_recycling, only: gk_neutral_recycling_state, initialize_gk_neutral_recycling, &
                                     recycle_lost_gk_ions, report_gk_neutral_recycling
 use mod_gk_neutral_reflection, only: gk_neutral_reflection_state, initialize_gk_neutral_reflection, &
                                      reflect_newly_lost_gk_neutrals, report_gk_neutral_reflection
-use phys_module, only: reflect_gk_neutrals
+use phys_module, only: reflect_gk_neutrals, use_gk_neutral_ionization, n_update_ionization_profiles, &
+                      gk_ionization_diagnostics, gk_ionization_adas_suffix, gk_ionization_adas_directory, &
+                      gk_ionization_outside_gc_action, gk_ionization_rejection_diagnostics
 use mod_gk_neutrals, only: gk_neutral_state, initialize_gk_neutrals, advance_gk_neutrals, &
                            report_gk_neutral_diagnostics
 use mod_particle_allocation, only: allocate_particles_for_sim
@@ -92,6 +95,11 @@ logical, parameter :: debug_slot_pools=.false.
 type(gk_neutral_state) :: neutrals
 type(gk_neutral_reflection_state) :: reflection
 type(gk_neutral_recycling_state) :: recycling
+type(gk_adas_ionization_state) :: ionization
+integer, allocatable :: ionization_wall_first(:)
+type(type_node_list) :: saved_collision_profiles
+logical :: profiles_current, saved_to_h5
+real*8 :: profile_clock, profile_seconds
 
 logical :: update_electric_potential ! move to input?
 integer :: ion_group, electron_group, neutral_group
@@ -319,6 +327,21 @@ call initialize_gk_neutrals(sim, neutral_group, neutrals)
 call MPI_BCAST(reflect_gk_neutrals, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
 call initialize_gk_neutral_reflection(sim, neutral_group, reflect_gk_neutrals, reflection)
 call initialize_gk_neutral_recycling(sim, ion_group, neutral_group, recycling)
+! These dedicated model011 parameters are outside the common historical broadcast buffer.
+call MPI_BCAST(use_gk_neutral_ionization,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
+call MPI_BCAST(n_update_ionization_profiles,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+call MPI_BCAST(gk_ionization_diagnostics,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
+call MPI_BCAST(gk_ionization_outside_gc_action,len(gk_ionization_outside_gc_action),MPI_CHARACTER,0,MPI_COMM_WORLD,ierr)
+call MPI_BCAST(gk_ionization_rejection_diagnostics,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
+call MPI_BCAST(gk_ionization_adas_suffix,len(gk_ionization_adas_suffix),MPI_CHARACTER,0,MPI_COMM_WORLD,ierr)
+call MPI_BCAST(gk_ionization_adas_directory,len(gk_ionization_adas_directory),MPI_CHARACTER,0,MPI_COMM_WORLD,ierr)
+if(use_gk_neutral_ionization.and.n_update_ionization_profiles<1) then
+  if(sim%my_id==0) write(*,*) 'ERROR: n_update_ionization_profiles must be positive'
+  call MPI_ABORT(MPI_COMM_WORLD,1,ierr)
+endif
+call initialize_gk_adas_ionization(sim,ionization,use_gk_neutral_ionization,ion_group,electron_group,neutral_group, &
+  gk_ionization_adas_suffix,gk_ionization_adas_directory,gk_ionization_diagnostics, &
+  gk_ionization_outside_gc_action,gk_ionization_rejection_diagnostics)
 call report_gk_neutral_diagnostics(sim, neutrals)
 
 ! q=0 neutrals are excluded from the Poisson RHS and all charged projections.
@@ -340,8 +363,10 @@ if (neutral_group <= size(sim%groups)) then
     project_profiles%f = [project_profiles%f, proj_f(proj_one, group=neutral_group)]
 endif
 
+profile_clock=MPI_WTIME()
 call with(sim, project_profiles)
 call project_profiles%set_vtk_active(.false.)
+call cache_ionization_profiles(sim,ionization,project_profiles%node_list,sim%time,MPI_WTIME()-profile_clock)
 
 project_density = new_projection(sim%fields%node_list, sim%fields%element_list, &
                       filter    = filter_perp,    filter_hyper    = filter_hyper,    filter_parallel    = filter_par,    &
@@ -427,6 +452,8 @@ do i=1, nstep_particles
 
   n_newly_lost_ions=0; n_newly_lost_electrons=0
   particle_start_time = sim%time
+  profiles_current=.false.
+  profile_seconds=0.d0
 
   index_now = index_now + 1
 
@@ -577,7 +604,16 @@ do i=1, nstep_particles
 
 
   ! Charged loss diagnostics are complete. New products first move next outer step.
-  call advance_gk_neutrals(sim, neutrals, tstep_particles, nsubstep_particles)
+  ! Frozen rates span the complete outer interval; one sampled physical event time.
+  ! Products first enter charged advancement next step. Wall-first neutrals retain
+  ! the established reflection/loss operator and unused-time convention.
+  if(ionization%enabled) then
+    call advance_gk_adas_ionization(sim,ionization,slot_registry,i,particle_start_time, &
+      tstep_particles*nsubstep_particles,sim%time,ionization_wall_first,substep_dt=tstep_particles)
+    call advance_gk_neutrals(sim,neutrals,tstep_particles,nsubstep_particles,verify_indices=ionization_wall_first)
+  else
+    call advance_gk_neutrals(sim,neutrals,tstep_particles,nsubstep_particles)
+  endif
   call reflect_newly_lost_gk_neutrals(sim, neutrals, reflection, sim%time, tstep_particles)
   call recycle_lost_gk_ions(sim, recycling, slot_registry, sim%time, tstep_particles)
   call finalize_lost_electrons()
@@ -605,7 +641,10 @@ do i=1, nstep_particles
   if (mod(index_now,n_update_profiles).eq. 0) then
     if (sim%my_id .eq. 0) write(*,'(A)') 'updating profiles for background Maxwellians'
 
+    profile_clock=MPI_WTIME()
     call with(sim, project_profiles)
+    profile_seconds=MPI_WTIME()-profile_clock
+    profiles_current=.true.
 
     if ((mod(index_now,n_update_temperature).eq. 0)) then             ! update temperature in jorek background (i.e. sim%fields)
       
@@ -645,8 +684,12 @@ do i=1, nstep_particles
     call report_gk_neutral_diagnostics(sim, neutrals)
     call report_gk_neutral_reflection(sim, reflection)
     call report_gk_neutral_recycling(sim, recycling)
+    call report_gk_adas_ionization(sim,ionization)
     call project_profiles%set_vtk_active(.true.)
+    profile_clock=MPI_WTIME()
     call with(sim, project_profiles)
+    profile_seconds=MPI_WTIME()-profile_clock
+    profiles_current=.true.
     call project_profiles%set_vtk_active(.false.)
     if (sim%my_id .eq. 0) then
       write(fileout,'(A8,i5.5)') 'profiles',index_now  
@@ -662,6 +705,24 @@ do i=1, nstep_particles
     endif
   endif
 
+  if(ionization%enabled) then
+    if(mod(i,n_update_ionization_profiles)==0) then
+      if(.not.profiles_current) then
+        ! Collisions also read project_profiles. Save/restore their legacy background
+        ! on ionization-only refreshes, while reusing the existing projection solve.
+        saved_collision_profiles=project_profiles%node_list
+        saved_to_h5=project_profiles%to_h5
+        project_profiles%to_h5=.false.
+        profile_clock=MPI_WTIME()
+        call with(sim,project_profiles)
+        profile_seconds=MPI_WTIME()-profile_clock
+        project_profiles%to_h5=saved_to_h5
+      endif
+      call cache_ionization_profiles(sim,ionization,project_profiles%node_list,sim%time,profile_seconds)
+      if(.not.profiles_current) project_profiles%node_list=saved_collision_profiles
+    endif
+  endif
+
   if (n_particles_out .gt. 0) then
     if (mod(index_now,n_particles_out) == 0) then
       write(filepart,'(A4,i5.5,A3)') 'part',index_now,'.h5'
@@ -671,6 +732,8 @@ do i=1, nstep_particles
   endif
 
 end do
+
+call report_gk_adas_ionization(sim,ionization)
 
 if (nstep_particles .gt. 0) then
   
@@ -865,7 +928,7 @@ use mod_particle_types, only: particle_gc_vpar, particle_kinetic_leapfrog, copy_
 use mod_event
 use mod_pcg32_rng
 use mod_interp, only: mode_moivre, interp_RZ, interp_0
-use mod_gc_variational, only : convert_gc_vpar_to_kinetic, copy_particle_gc_vpar, push_gc_rk4
+use mod_gc_variational, only : convert_gc_vpar_to_kinetic, copy_particle_gc_vpar, push_gc_rk4, GC_NUMERICAL_FAILURE
 use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 use phys_module, only: F0, CENTRAL_MASS, CENTRAL_DENSITY, ei_small_angle_scattering_Orb5, ei_small_angle_scattering_Lu
 use omp_lib
@@ -882,6 +945,7 @@ real*8, intent(in)                            :: timesteps, particle_start_time 
 integer, intent(in)                           :: n_steps                    ! the number of time steps
 logical, intent(in)                           :: update                     ! switch to update particle position (.true.) or calculate only rhs contribution to Poisson (not used currenly)
 integer, intent(inout)                        :: lost(:) ! transient newly-lost events only
+integer :: gc_status, gc_failures, gc_failures_global, gc_mpi_error
 integer                                       :: n_lost                     ! the current number of lost particles in lost array
 real*8                                        :: energy_local,    energy_lost_local   ! the energy and energy loss in this timestep [J]
 real*8                                        :: momentum_local,  momentum_lost_local ! momentum and momentum loss in this timeste [kg m/s] (?)
@@ -959,6 +1023,7 @@ do i=1,n_stream
   call rng(i)%initialize(6, seed, n_stream, i)
 end do
 
+gc_failures=0
 select type (particles => sim%groups(i_group)%particles)
 type is (particle_gc_vpar)
 
@@ -976,7 +1041,7 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
   !$omp rng, lost, n_lost, ion_group,                                &
   !$omp ei_small_angle_scattering_Orb5, ei_small_angle_scattering_Lu,            &
   !$omp project_profiles, project_density)                                       &
-  !$omp private(particle_tmp, i_rng, i,j,k,l,m, t, E, B, psi, U, rz_old, st_old, lost_st, lost_phi, &
+  !$omp private(gc_status, particle_tmp, i_rng, i,j,k,l,m, t, E, B, psi, U, rz_old, st_old, lost_st, lost_phi, &
   !$omp i_elm_old, i_elm, zn0, zne0, zni0, Te_eV, Te0_eV, Ti0_eV,                &
   !$omp p_orbit, ran1, ran2,                                                     & 
   !$omp P2, P3, P6, R_g, R_s, R_t, Z_g, Z_s, Z_t, xjac, HH, HH_s, HH_t, index_lm,&
@@ -985,7 +1050,7 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
   !$omp vpar_i0, vpar_e0, vpar0, i_coll, n_coll_ei, collision_frequency,         &
   !$omp va_par, va_perp, va_par_out, va_perp_out, v_E, v_P,                      &
   !$omp ifail, v, v_s, v_t, v_R, v_Z, HHZ, HHZ_p, already_lost, energy_before, energy_after)    &
-  !$omp reduction(+:feedback_rhs,                                                &
+  !$omp reduction(+:gc_failures, feedback_rhs,                                                &
   !$omp energy_lost_local, energy_local, momentum_lost_local, momentum_local,    &
   !$omp potential_energy_local, potential_energy_lost_local)
   do j=1,size(particles,1)
@@ -999,8 +1064,16 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
     if (particle_tmp%i_elm .le. 0) already_lost = .true.
 
     call push_gc_rk4(sim%fields, particle_tmp, sim%groups(i_group)%mass, timesteps, n_steps, n_orbit, &
-                     lost_st=lost_st, lost_phi=lost_phi)
-    ! Preserve the boundary metadata without changing accepted GC velocity or energy.
+                     lost_st=lost_st, lost_phi=lost_phi, wall_status=gc_status)
+    if(gc_status==GC_NUMERICAL_FAILURE)then
+      gc_failures=gc_failures+1
+      !$omp critical(gc_failure_report)
+      write(*,*) "Unresolved GC advance rank/group/slot/time/element: ",sim%my_id,i_group,j,particle_start_time,particle_tmp%i_elm
+      write(*,*) "Retained GC x/st/vpar/mu: ",particle_tmp%x,particle_tmp%st,particle_tmp%vpar,particle_tmp%mu
+      !$omp end critical(gc_failure_report)
+      cycle
+    endif
+    ! Retain the existing stage-loss metadata and accepted-state energy convention.
     if (retain_wall_metadata.and..not.already_lost.and.particle_tmp%i_elm<0) then
       particle_tmp%st=lost_st
       particle_tmp%x(3)=lost_phi
@@ -1122,6 +1195,14 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
   !$omp end parallel do
     
 end select
+
+! All ranks vote before deposition, recycling or electron finalization. A failed
+! particle retains its entry state and never enters the newly-lost event buffer.
+call MPI_ALLREDUCE(gc_failures,gc_failures_global,1,MPI_INTEGER,MPI_SUM,MPI_COMM_WORLD,gc_mpi_error)
+if(gc_failures_global/=0)then
+  if(sim%my_id==0)write(*,*) 'Unresolved GC advances; no unresolved particle released: ',gc_failures_global
+  call MPI_ABORT(MPI_COMM_WORLD,1,gc_mpi_error)
+endif
 
 t = particle_start_time + n_steps*timesteps
 

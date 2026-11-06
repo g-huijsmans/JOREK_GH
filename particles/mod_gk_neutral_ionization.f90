@@ -1,9 +1,11 @@
-!> Deterministic whole-marker H0 -> H+ + e- infrastructure; not called by a main.
+!> Transactional whole-marker H0 -> H+ + e- conversion, with optional staged events.
 module mod_gk_neutral_ionization
 use mpi
 use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
 use mod_particle_sim, only: particle_sim
 use mod_particle_slot_pool
+use mod_gk_neutral_trajectory, only: validate_neutral_start_coordinates, boundary_sides
+use mod_gk_gc_boundary
 use mod_particle_types, only: particle_gc_vpar, particle_kinetic_leapfrog, codify_particle_type
 use mod_find_rz_nearby, only: find_RZ_nearby
 use mod_math_operators, only: cross_product
@@ -13,6 +15,23 @@ implicit none
 private
 public :: gk_neutral_ionization_state, initialize_gk_neutral_ionization
 public :: ionize_selected_gk_neutrals, report_gk_neutral_ionization
+integer, parameter, public :: GC_VALID=1, GC_OUTSIDE_PHYSICAL_DOMAIN=2, GC_ERROR=3
+public :: gk_ionization_preflight, gc_boundary_evidence, preflight_gk_ionization
+! Prepared products are opaque outside this module. They are bound to the exact
+! staged source, time and species masses, and consumed within one frozen-field epoch.
+type :: gk_ionization_preflight
+  private
+  logical :: valid=.false.
+  type(particle_kinetic_leapfrog) :: source
+  type(particle_gc_vpar) :: ion,electron
+  real*8 :: time=0.d0,masses(3)=0.d0,en=0.d0,ei=0.d0
+  integer :: groups(3)=0
+end type
+type :: gc_boundary_evidence
+  integer :: locator_status=0,locator_element=0,source_winding=-99,gc_winding=-99
+  integer :: wall_element=0,wall_side=0,reason=0
+  real*8 :: gc_x(3)=0.d0,source_distance(2)=-1.d0,gc_distance(2)=-1.d0
+end type
 real*8, parameter :: energy_tolerance=128.d0*epsilon(1.d0)
 type :: gk_neutral_ionization_state
   integer :: ion_group=0, electron_group=0, neutral_group=0
@@ -143,13 +162,19 @@ end subroutine
 
 !> Validate, stage, vote globally, then commit. No allocation/growth or migration of
 !> particle slots; lost (negative-index) destinations are deliberately protected.
-subroutine ionize_selected_gk_neutrals(sim,state,registry,neutral_indices,reaction_time,ierr)
+subroutine ionize_selected_gk_neutrals(sim,state,registry,neutral_indices,reaction_time,ierr,reaction_times,reaction_sources,vote_seconds,prepared_products)
   class(particle_sim), intent(inout) :: sim
   type(gk_neutral_ionization_state), intent(inout) :: state
   type(particle_slot_registry), intent(inout) :: registry
   integer, intent(in) :: neutral_indices(:)
   real*8, intent(in) :: reaction_time
   integer, optional, intent(out) :: ierr
+  type(gk_ionization_preflight), optional, intent(in) :: prepared_products(:)
+  real*8, optional, intent(out) :: vote_seconds
+  real*8 :: vote_start
+  ! Scalar time remains the reporting/legacy interface. Event arrays never mutate sources.
+  real*8, optional, intent(in) :: reaction_times(:)
+  type(particle_kinetic_leapfrog), optional, intent(in) :: reaction_sources(:)
   type(particle_gc_vpar), allocatable :: ions(:),electrons(:)
   integer, allocatable :: ion_slots(:),electron_slots(:)
   real*8 :: totals(10)
@@ -157,9 +182,11 @@ subroutine ionize_selected_gk_neutrals(sim,state,registry,neutral_indices,reacti
   n=size(neutral_indices)
   state%counts(1)=state%counts(1)+n
   call stage_transaction(sim,state,registry,neutral_indices,reaction_time,ions,electrons, &
-                         ion_slots,electron_slots,totals,local_error)
+                         ion_slots,electron_slots,totals,local_error,reaction_times,reaction_sources,prepared_products)
   if(local_error/=0) state%counts(3)=state%counts(3)+1
+  vote_start=MPI_WTIME()
   call vote(local_error,error,ierr)
+  if(present(vote_seconds)) vote_seconds=MPI_WTIME()-vote_start
   if(error/=0) return
   ! Every rank has successfully staged both products. No failure paths below here.
   select type(p=>sim%groups(state%ion_group)%particles)
@@ -186,7 +213,7 @@ subroutine ionize_selected_gk_neutrals(sim,state,registry,neutral_indices,reacti
   state%reaction_time=reaction_time
 end subroutine
 
-subroutine stage_transaction(sim,state,registry,indices,time,ions,electrons,ion_slots,electron_slots,totals,error)
+subroutine stage_transaction(sim,state,registry,indices,time,ions,electrons,ion_slots,electron_slots,totals,error,times,sources,prepared)
   class(particle_sim), intent(in) :: sim
   type(gk_neutral_ionization_state), intent(in) :: state
   type(particle_slot_registry), intent(in) :: registry
@@ -196,6 +223,12 @@ subroutine stage_transaction(sim,state,registry,indices,time,ions,electrons,ion_
   integer, allocatable, intent(out) :: ion_slots(:),electron_slots(:)
   real*8, intent(out) :: totals(10)
   integer, intent(out) :: error
+  real*8, optional, intent(in) :: times(:)
+  type(particle_kinetic_leapfrog), optional, intent(in) :: sources(:)
+  type(gk_ionization_preflight), optional, intent(in) :: prepared(:)
+  type(particle_kinetic_leapfrog) :: source
+  real*8 :: event_time,source_v2,event_v2,checked_st(2)
+  logical :: ordered,valid_start
   integer :: n,k,j,g,ni,ne,conversion_error
   real*8 :: en,ei
   character(len=240) :: message
@@ -211,6 +244,26 @@ subroutine stage_transaction(sim,state,registry,indices,time,ions,electrons,ion_
     call reject(sim,g,0,'reaction_time must be finite and representable as real*4 t_birth')
     return
   endif
+  if(present(times)) then
+    if(size(times)/=n) then
+      call reject(sim,g,0,'event-time array size mismatch');return
+    endif
+    if(.not.all(ieee_is_finite(times)).or.any(abs(times)>real(huge(0.e0),8))) then
+      call reject(sim,g,0,'event times must be finite and representable as t_birth');return
+    endif
+  endif
+  if(present(sources)) then
+    if(size(sources)/=n.or..not.present(times)) then
+      call reject(sim,g,0,'staged source array requires matching event times');return
+    endif
+  endif
+  if(present(prepared)) then
+    if(size(prepared)/=n.or..not.present(sources).or..not.present(times)) then
+      call reject(sim,g,0,'prepared products require matching source/time arrays');return
+    endif
+  endif
+  ordered=.true.
+  if(n>1) ordered=all(indices(2:)>indices(:n-1))
   call check_particle_slot_registry_groups(sim,registry, &
        [state%ion_group,state%electron_group,state%neutral_group],error)
   if(error/=0) then
@@ -261,9 +314,11 @@ subroutine stage_transaction(sim,state,registry,indices,time,ions,electrons,ion_
         call reject(sim,g,j,'selected index outside neutral array')
         return
       endif
-      if(any(indices(:k-1)==j)) then
-        call reject(sim,g,j,'duplicate selected neutral index')
-        return
+      if(.not.ordered) then
+        if(any(indices(:k-1)==j)) then
+          call reject(sim,g,j,'duplicate selected neutral index')
+          return
+        endif
       endif
       if(p(j)%i_elm<=0.or.p(j)%q/=0) then
         call reject(sim,g,j,'selected source must be active with q=0; no double conversion')
@@ -274,14 +329,42 @@ subroutine stage_transaction(sim,state,registry,indices,time,ions,electrons,ion_
         call reject(sim,g,j,'source weight must be finite positive and velocity finite')
         return
       endif
-      if(.not.valid_position(sim,p(j)%x,p(j)%st,p(j)%i_elm)) then
+      checked_st=p(j)%st;valid_start=.true.
+      if(present(sources)) then
+        ! The source may retain a roundoff wall coordinate already validated by
+        ! the flight verifier. Reuse that check without mutating its provenance.
+        call validate_neutral_start_coordinates(sim%fields%node_list,sim%fields%element_list, &
+          p(j)%i_elm,p(j)%x,p(j)%st,checked_st,valid_start)
+      endif
+      if(.not.valid_start.or..not.valid_position(sim,p(j)%x,checked_st,p(j)%i_elm)) then
         call reject(sim,g,j,'invalid source position, st or element')
         return
       endif
     enddo
     do k=1,n
       j=indices(k)
-      call stage_products(sim,state,p(j),time,ions(k),electrons(k),en,ei,conversion_error)
+      source=p(j);event_time=time
+      if(present(times)) event_time=times(k)
+      if(present(sources)) then
+        source=sources(k)
+        call validate_reaction_source(sim,p(j),source,conversion_error)
+        if(conversion_error/=0)then
+          call reject(sim,g,j,'invalid staged ballistic source identity, position or kinetic energy');return
+        endif
+      endif
+      if(present(prepared)) then
+        conversion_error=1
+        if(prepared(k)%valid.and.prepared(k)%time==event_time.and. &
+           all(prepared(k)%groups==[state%ion_group,state%electron_group,state%neutral_group]).and. &
+           all(prepared(k)%masses==sim%groups([state%ion_group,state%electron_group,state%neutral_group])%mass)) then
+          if(same_source(prepared(k)%source,source))then
+            ions(k)=prepared(k)%ion;electrons(k)=prepared(k)%electron
+            en=prepared(k)%en;ei=prepared(k)%ei;conversion_error=0
+          endif
+        endif
+      else
+        call stage_products(sim,state,source,event_time,ions(k),electrons(k),en,ei,conversion_error)
+      endif
       if(conversion_error/=0) then
         call reject(sim,g,j,'product staging failed; global transaction cancelled')
         return
@@ -335,7 +418,104 @@ subroutine magnetic_field(sim,time,x,st,element,B,Bnorm,error)
   if(error/=0) call reject(sim,0,0,'magnetic field must be finite with strictly positive norm')
 end subroutine
 
-subroutine stage_products(sim,state,source,time,ion,electron,en,ei,error)
+logical function same_source(a,b) result(same)
+  type(particle_kinetic_leapfrog),intent(in)::a,b
+  same=a%i_elm==b%i_elm.and.a%q==b%q.and.a%i_life==b%i_life.and. &
+    a%weight==b%weight.and.a%t_birth==b%t_birth.and.all(a%x==b%x).and.all(a%v==b%v).and.all(a%st==b%st)
+end function
+
+subroutine validate_reaction_source(sim,original,source,error)
+  class(particle_sim),intent(in)::sim
+  type(particle_kinetic_leapfrog),intent(in)::original,source
+  integer,intent(out)::error
+  real*8::source_v2,event_v2
+  error=1
+  if(source%q/=original%q.or.source%weight/=original%weight.or. &
+     source%i_life/=original%i_life.or.source%t_birth/=original%t_birth)return
+  if(.not.all(ieee_is_finite(source%v)).or. &
+     .not.valid_position(sim,source%x,source%st,source%i_elm))return
+  source_v2=sum(original%v**2);event_v2=sum(source%v**2)
+  if(.not.all(ieee_is_finite([source_v2,event_v2])).or. &
+     abs(event_v2-source_v2)>energy_tolerance*max(source_v2,event_v2,tiny(1.d0)))return
+  error=0
+end subroutine
+
+subroutine preflight_gk_ionization(sim,state,source,time,geometry,prepared,classification,evidence,original)
+  class(particle_sim),intent(in)::sim
+  type(gk_neutral_ionization_state),intent(in)::state
+  type(particle_kinetic_leapfrog),intent(in)::source
+  real*8,intent(in)::time
+  type(gc_boundary_geometry),intent(in)::geometry
+  type(gk_ionization_preflight),intent(out)::prepared
+  integer,intent(out)::classification
+  type(gc_boundary_evidence),intent(out)::evidence
+  type(particle_kinetic_leapfrog),optional,intent(in)::original
+  integer::error
+  classification=GC_ERROR
+  if(.not.state%initialized)return
+  if(.not.allocated(sim%fields).or..not.allocated(sim%groups))return
+  if(.not.associated(sim%fields%node_list).or..not.associated(sim%fields%element_list))return
+  if(any([state%ion_group,state%electron_group,state%neutral_group]<1).or. &
+     any([state%ion_group,state%electron_group,state%neutral_group]>size(sim%groups)))return
+  if(.not.all(ieee_is_finite(sim%groups([state%ion_group,state%electron_group,state%neutral_group])%mass)))return
+  if(any(sim%groups([state%ion_group,state%electron_group,state%neutral_group])%mass<=0.d0))return
+  if(.not.ieee_is_finite(time).or.abs(time)>real(huge(0.e0),8))return
+  if(source%q/=0.or..not.ieee_is_finite(source%weight).or.source%weight<=0.d0)return
+  if(.not.all(ieee_is_finite(source%v)))return
+  if(.not.valid_position(sim,source%x,source%st,source%i_elm))return
+  if(present(original))then
+    call validate_reaction_source(sim,original,source,error)
+    if(error/=0)return
+  endif
+  call stage_products(sim,state,source,time,prepared%ion,prepared%electron, &
+    prepared%en,prepared%ei,error,geometry,classification,evidence)
+  if(error/=0)return
+  prepared%source=source;prepared%time=time
+  prepared%groups=[state%ion_group,state%electron_group,state%neutral_group]
+  prepared%masses=sim%groups(prepared%groups)%mass
+  prepared%valid=.true.
+end subroutine
+
+subroutine classify_gc_exit(sim,source,ion,ifail,geometry,classification,evidence)
+  class(particle_sim),intent(in)::sim
+  type(particle_kinetic_leapfrog),intent(in)::source
+  type(particle_gc_vpar),intent(in)::ion
+  integer,intent(in)::ifail
+  type(gc_boundary_geometry),intent(in)::geometry
+  integer,intent(out)::classification
+  type(gc_boundary_evidence),intent(out)::evidence
+  logical::ok,sides(4)
+  integer::e,s,unused_element,unused_side
+  real*8::distance(4)
+  classification=GC_ERROR;evidence%reason=1
+  evidence%gc_x=ion%x;evidence%locator_status=ifail;evidence%locator_element=ion%i_elm
+  ! A numerical/non-wall locator failure is NEVER downgraded, even if a separate
+  ! point classifier could place its coordinates outside.
+  if(ifail/=-1.or.ion%i_elm>=0)return
+  e=-ion%i_elm
+  if(e<1.or.e>sim%fields%element_list%n_elements)return
+  if(.not.all(ieee_is_finite(ion%st)))return
+  if(.not.geometry%valid)return
+  if(geometry%n_nodes/=sim%fields%node_list%n_nodes.or. &
+     geometry%n_elements/=sim%fields%element_list%n_elements)return
+  sides=boundary_sides(sim%fields%node_list,sim%fields%element_list,e)
+  distance=abs([ion%st(2),1.d0-ion%st(1),1.d0-ion%st(2),ion%st(1)])
+  if(count(sides.and.distance<=128.d0*epsilon(1.d0))/=1)return
+  s=findloc(sides.and.distance<=128.d0*epsilon(1.d0),.true.,dim=1)
+  if(sim%fields%element_list%element(e)%neighbours(s)/=0)return
+  evidence%reason=2
+  call boundary_winding(geometry,source%x(:2),evidence%source_winding,ok)
+  if(.not.ok.or.evidence%source_winding/=1)return
+  call boundary_winding(geometry,ion%x(:2),evidence%gc_winding,ok)
+  if(.not.ok.or.evidence%gc_winding/=0)return
+  classification=GC_OUTSIDE_PHYSICAL_DOMAIN;evidence%reason=3
+  call boundary_distance_bounds(geometry,source%x(:2),evidence%source_distance(1), &
+    evidence%source_distance(2),unused_element,unused_side)
+  call boundary_distance_bounds(geometry,ion%x(:2),evidence%gc_distance(1), &
+    evidence%gc_distance(2),evidence%wall_element,evidence%wall_side)
+end subroutine
+
+subroutine stage_products(sim,state,source,time,ion,electron,en,ei,error,geometry,classification,evidence)
   class(particle_sim), intent(in) :: sim
   type(gk_neutral_ionization_state), intent(in) :: state
   type(particle_kinetic_leapfrog), intent(in) :: source
@@ -343,9 +523,13 @@ subroutine stage_products(sim,state,source,time,ion,electron,en,ei,error)
   type(particle_gc_vpar), intent(out) :: ion,electron
   real*8, intent(out) :: en,ei
   integer, intent(out) :: error
+  type(gc_boundary_geometry),optional,intent(in)::geometry
+  integer,optional,intent(out)::classification
+  type(gc_boundary_evidence),optional,intent(out)::evidence
   integer :: ifail
   real*8 :: B(3),Bnorm,b0(3),v2,perp2,displacement(3),radial,mi,mn
   error=1
+  if(present(classification))classification=GC_ERROR
   call magnetic_field(sim,time,source%x,source%st,source%i_elm,B,Bnorm,ifail)
   if(ifail/=0) return
   mi=sim%groups(state%ion_group)%mass*ATOMIC_MASS_UNIT
@@ -355,6 +539,9 @@ subroutine stage_products(sim,state,source,time,ion,electron,en,ei,error)
   if(.not.ieee_is_finite(v2).or..not.ieee_is_finite(perp2)) return
   if(perp2 < -32.d0*epsilon(v2)*max(v2,tiny(v2))) return
   perp2=max(0.d0,perp2)
+  ! Invalid source energy is an error even when its prospective GC is outside.
+  en=0.5d0*mn*v2*source%weight
+  if(.not.ieee_is_finite(en))return
   ! Preserve the shared JOREK kinetic-to-GC sign in its (R,Z,phi) component order.
   displacement=mi*cross_product(source%v,b0)/(EL_CHG*Bnorm)
   radial=source%x(1)+displacement(1)
@@ -366,7 +553,13 @@ subroutine stage_products(sim,state,source,time,ion,electron,en,ei,error)
                      ion%st(1),ion%st(2),ion%i_elm,ifail,phi=ion%x(3))
   ! Current finite-Larmor-radius boundary limitation: both source and GC must be inside.
   if(ifail/=0.or.ion%i_elm<=0) then
+    if(present(geometry).and.present(classification).and.present(evidence))then
+      call classify_gc_exit(sim,source,ion,ifail,geometry,classification,evidence)
+      return
+    endif
     call reject(sim,state%ion_group,0,'guiding centre outside mesh or locator failure (finite-Larmor-radius limit)')
+    write(*,'(A,ES25.16E3,3I12,17ES25.16E3)') 'GK rejected product time/source_element/GC_element/locator/source_x/v/st/B/displacement/GC_x=', &
+      time,source%i_elm,ion%i_elm,ifail,source%x,source%v,source%st,B,displacement,ion%x
     return
   endif
   if(.not.valid_position(sim,ion%x,ion%st,ion%i_elm)) return
@@ -387,6 +580,7 @@ subroutine stage_products(sim,state,source,time,ion,electron,en,ei,error)
     return
   endif
   error=0
+  if(present(classification))classification=GC_VALID
 end subroutine
 
 subroutine report_gk_neutral_ionization(sim,state)

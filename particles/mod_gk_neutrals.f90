@@ -120,11 +120,16 @@ end subroutine push_gk_neutral_ballistic
 
 !> One call per outer step, using the same dt and substep count as the ions.
 !> Loss counters refer only to this outer step, including steps not printed.
-subroutine advance_gk_neutrals(sim, neutrals, dt, nsubsteps)
+subroutine advance_gk_neutrals(sim, neutrals, dt, nsubsteps, verify_indices)
   class(particle_sim), intent(inout) :: sim
   type(gk_neutral_state), intent(inout) :: neutrals
   real*8, intent(in) :: dt
   integer, intent(in) :: nsubsteps
+  ! Sorted wall-first ionization candidates require verification even for an
+  ! interior locator endpoint (a path can leave and re-enter a curved domain).
+  integer, optional, intent(in) :: verify_indices(:)
+  integer :: verify_cursor
+  logical :: force_verification
   integer :: g, j, step, old_element, ifail, locator_element, visit_bin, outcome
   type(side_correction) :: verification
   real*8 :: old_rz(2), old_st(2), old_x(3), old_v(3)
@@ -148,8 +153,16 @@ subroutine advance_gk_neutrals(sim, neutrals, dt, nsubsteps)
   call validate_neutral_charges(sim, g)
   select type (p => sim%groups(g)%particles)
   type is (particle_kinetic_leapfrog)
+    verify_cursor=1
     do j=1,size(p)
       if (p(j)%i_elm <= 0) cycle
+      force_verification=.false.
+      if(present(verify_indices)) then
+        if(verify_cursor<=size(verify_indices)) then
+          force_verification=verify_indices(verify_cursor)==j
+          if(force_verification) verify_cursor=verify_cursor+1
+        endif
+      endif
       do step=1,nsubsteps
         old_x = p(j)%x
         old_v = p(j)%v
@@ -167,7 +180,7 @@ subroutine advance_gk_neutrals(sim, neutrals, dt, nsubsteps)
         ! A clipped locator search is not a physical trajectory. Verify only
         ! suspicious returns, before any loss counters or event records change.
         locator_element=p(j)%i_elm
-        if(locator_element<=0) then
+        if(locator_element<=0.or.force_verification) then
           if(any([neutrals%zero_count,neutrals%zero_wall_count,neutrals%zero_interior_count, &
                   neutrals%zero_unresolved_count,neutrals%roundoff_count]==huge(0))) &
             call unresolved_loss(sim,neutrals,j,locator_element,old_element,'verification counter overflow',0)
@@ -196,6 +209,7 @@ subroutine advance_gk_neutrals(sim, neutrals, dt, nsubsteps)
             neutrals%roundoff_count=neutrals%roundoff_count+1
           select case(verification%status)
           case(INTERIOR_ENDPOINT)
+            if(locator_element<=0) then
             if(neutrals%recovered_count==huge(0)) &
               call unresolved_loss(sim,neutrals,j,locator_element,old_element,'recovered count overflow', &
                                    verification%n_visits)
@@ -204,9 +218,10 @@ subroutine advance_gk_neutrals(sim, neutrals, dt, nsubsteps)
             write(*,*) ' locator st=',p(j)%st,' corrected st=',verification%st, &
               ' interior crossings=',verification%n_trace,' physical wall crossings=0', &
               ' elements visited=',verification%n_visits,' max geometric residual=',verification%max_residual
+            endif
             p(j)%i_elm=verification%element
             p(j)%st=verification%st
-            neutrals%recovered_count=neutrals%recovered_count+1
+            if(locator_element<=0) neutrals%recovered_count=neutrals%recovered_count+1
             if(locator_element==0) neutrals%zero_interior_count=neutrals%zero_interior_count+1
             cycle ! Continue any remaining substeps, without a loss event or RNG.
           case(WALL_CROSSING)

@@ -11,6 +11,7 @@ module mod_gc_variational
   public initialise_gc_Qin
   public push_gc_Qin
   public push_gc_rk4
+  integer, parameter :: GC_STEP_VALID=0, GC_WALL_LOSS=1, GC_NUMERICAL_FAILURE=2
   public convert_leapfrog_to_gc_vpar
   public convert_gc_to_gc_vpar
 contains
@@ -58,9 +59,10 @@ subroutine convert_gc_to_gc_vpar(particle_in, B_norm, mass, particle_out)
 
 end
 
-subroutine convert_leapfrog_to_gc_vpar(node_list, element_list, particle_in, B, mass, particle_out)
+subroutine convert_leapfrog_to_gc_vpar(node_list, element_list, particle_in, B, mass, particle_out, my_ifail)
   use data_structure
-  use mod_math_operators, only: cross_product
+  use mod_pusher_tools, only: particle_position_to_gc, GC_GEOMETRY_INVALID
+  use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
   use mod_find_rz_nearby
   implicit none
 
@@ -72,33 +74,47 @@ subroutine convert_leapfrog_to_gc_vpar(node_list, element_list, particle_in, B, 
   type(particle_gc_vpar)                      :: particle_out
   real*8  :: B_hat(3), B_norm, v_par, v2
   integer :: ifail
+  integer, optional, intent(out) :: my_ifail
 
   call copy_particle_base(particle_in, particle_out)
 
   particle_out%q      = particle_in%q
   particle_out%weight = particle_in%weight
 
+  if (present(my_ifail)) my_ifail = GC_GEOMETRY_INVALID
+  particle_out%vpar = 0.d0
+  particle_out%mu = 0.d0
+  particle_out%B_norm = 0.d0
+  if (.not. all(ieee_is_finite(B)) .or. .not. all(ieee_is_finite(particle_in%v)) .or. &
+      .not. ieee_is_finite(mass) .or. mass <= 0.d0) then
+    particle_out%i_elm = 0
+    return
+  endif
   B_norm = norm2(B)
+  if (.not. ieee_is_finite(B_norm) .or. B_norm <= 0.d0) then
+    particle_out%i_elm = 0
+    return
+  endif
   B_hat  = B/B_norm
   v_par  = dot_product(particle_in%v,B_hat)
   v2     = dot_product(particle_in%v,particle_in%v)
 
-  ! Calculate GC position
-  if (particle_out%q .ne. 0) then
-    particle_out%x = particle_in%x + (mass*ATOMIC_MASS_UNIT*cross_product(particle_in%v,B_hat))/(particle_in%q*EL_CHG*B_norm)
-  else
-    particle_out%x = particle_in%x
-  end if
+  ! Inverse displacement uses B and velocity in the kinetic position's basis.
+  call particle_position_to_gc(node_list,element_list,particle_in%x,particle_in%st, &
+      particle_in%i_elm,mass*particle_in%v,particle_in%q,B_hat,B_norm, &
+      particle_out%x,particle_out%st,particle_out%i_elm)
 
   ! Calculate velocity-related variables
   particle_out%vpar  = v_par
   ! Perhaps we could also use the magnetic field in the guiding center to calculate
   ! v_perp, but don't do it for now.
-  particle_out%mu = 0.5d0 * (v2 - v_par**2) / B_norm
+  particle_out%mu = 0.5d0 * sum((particle_in%v-v_par*B_hat)**2) / B_norm
 
-  ! Calculate new st and i_elm
-  call find_RZ_nearby(node_list, element_list, particle_in%x(1), particle_in%x(2), particle_in%st(1), particle_in%st(2), particle_in%i_elm, &
-                      particle_out%x(1), particle_out%x(2), particle_out%st(1), particle_out%st(2), particle_out%i_elm, ifail)
+  particle_out%B_norm = B_norm
+  if (present(my_ifail)) then
+    my_ifail = 0
+    if (particle_out%i_elm <= 0) my_ifail = -1
+  endif
 end
 
 subroutine copy_particle_gc_Qin(particle_in,particle_out)
@@ -161,11 +177,13 @@ particle_out%weight= particle_in%weight
 return
 end
    
-subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, mass, n_phases, particle_out, my_ifail)
+subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, mass, n_phases, particle_out, my_ifail, gyro_phase)
   use constants
   use data_structure
-  use mod_pusher_tools, only: get_orthonormals
-  use mod_math_operators, only: cross_product
+  use mod_pusher_tools, only: get_orthonormals, larmor_displacement, cylindrical_displacement, &
+      GC_GEOMETRY_INVALID
+  use mod_coordinate_transforms, only: vector_rotation
+  use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
   use mod_find_rz_nearby
   implicit none
 
@@ -177,14 +195,20 @@ subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, m
   integer, intent(in)  :: n_phases    !< number of points of the gyro orbit
   type(particle_kinetic_leapfrog), intent(out)  :: particle_out(:)
   integer, intent(out) :: my_ifail
+  ! Optional deterministic phase in radians; absent retains exactly one RNG draw.
+  real*8, optional, intent(in) :: gyro_phase
 
   real*8  :: B_norm, v_perp, v_par, B_hat(3), e1(3), e2(3), chi, chi_start
+  real*8 :: rho(3), delta_phi, velocity_at_gc(3)
   integer :: i, ifail
 
   ifail = 0
   my_ifail = 0
 
-  if (n_phases .lt. 0) return
+  if (n_phases < 0 .or. size(particle_out) < max(1,n_phases)) then
+    my_ifail = GC_GEOMETRY_INVALID
+    return
+  endif
 
   if (n_phases .eq. 0) then             ! return a kinetic particle at gyro-centre
     particle_out(1)%x      = particle_in%x
@@ -196,7 +220,27 @@ subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, m
   endif
 
 
+  ! Consume the same draw as the original normal path, before validating data.
+  if (present(gyro_phase)) then
+    chi_start = gyro_phase
+  else
+    call random_number(chi_start)
+    chi_start = chi_start * TWOPI
+  endif
+  do i=1,n_phases
+    particle_out(i)%x = particle_in%x
+    particle_out(i)%st = particle_in%st
+    particle_out(i)%i_elm = 0
+    particle_out(i)%q = particle_in%q
+    particle_out(i)%weight = particle_in%weight
+    particle_out(i)%v = 0.d0
+  enddo
+  my_ifail = GC_GEOMETRY_INVALID
+  if (.not. all(ieee_is_finite(B)) .or. .not. ieee_is_finite(mass)) return
+  if (.not. ieee_is_finite(particle_in%mu) .or. .not. ieee_is_finite(particle_in%vpar)) return
+  if (.not. ieee_is_finite(chi_start) .or. mass <= 0.d0 .or. particle_in%mu < 0.d0) return
   B_norm = sqrt(dot_product(B,B))
+  if (.not. ieee_is_finite(B_norm) .or. B_norm <= 0.d0) return
   B_hat  = B/B_norm
 
   v_perp = sqrt(2.d0 * particle_in%mu * B_norm) ! [m/s]
@@ -204,10 +248,7 @@ subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, m
   ! Define chi as the angle of the velocity vector with b x r
   call get_orthonormals(B_hat, e1, e2)
 
-  call random_number(chi_start)
- ! chi_start = 0.d0
-
-  chi_start = chi_start * TWOPI ! replace with pcg32
+  my_ifail = 0
 
   do i = 1, n_phases
     
@@ -218,23 +259,24 @@ subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, m
     particle_out(i)%q      = particle_in%q
     particle_out(i)%weight = particle_in%weight
 
-    if (particle_in%q .ne. 0) then
-
-      !CHECK for phi! gyro orbit should be in the plane perpendicular to B
-      particle_out(i)%x = particle_in%x - (mass*ATOMIC_MASS_UNIT*cross_product(particle_out(i)%v,B_hat))/(real(particle_in%q,8)*EL_CHG*B_norm)
-
+    velocity_at_gc = particle_out(i)%v
+    call larmor_displacement(mass*velocity_at_gc,particle_in%q,B_hat,B_norm,rho,ifail)
+    if (ifail == 0) call cylindrical_displacement(particle_in%x,rho,particle_out(i)%x,delta_phi,ifail)
+    if (ifail /= 0) then
+      my_ifail = GC_GEOMETRY_INVALID
+      particle_out(i)%i_elm = 0
+      cycle
+    endif
+    particle_out(i)%v = vector_rotation(velocity_at_gc,-delta_phi)
+    if (particle_in%q /= 0) then
       call find_RZ_nearby(node_list, element_list, &
-             particle_in%x(1),     particle_in%x(2),     particle_in%st(1),     particle_in%st(2),     particle_in%i_elm, &
-             particle_out(i)%x(1), particle_out(i)%x(2), particle_out(i)%st(1), particle_out(i)%st(2), particle_out(i)%i_elm, ifail)
-  
-      if (ifail .ne. 0) my_ifail = ifail
+          particle_in%x(1),particle_in%x(2),particle_in%st(1),particle_in%st(2),particle_in%i_elm, &
+          particle_out(i)%x(1),particle_out(i)%x(2),particle_out(i)%st(1),particle_out(i)%st(2), &
+          particle_out(i)%i_elm,ifail)
+      if (ifail /= 0 .and. my_ifail /= GC_GEOMETRY_INVALID) my_ifail = ifail
     else
-
-      particle_out(i)%x     = particle_in%x
-      particle_out(i)%st    = particle_in%st
       particle_out(i)%i_elm = particle_in%i_elm
-
-    end if
+    endif
 
   enddo
 
@@ -422,10 +464,15 @@ enddo
 return
 end
 
-subroutine push_gc_rk4(fields, particle_gc, mass, timestep, n_steps, n_gyro_phases, gyro_shift, lost_st, lost_phi)
+subroutine push_gc_rk4(fields, particle_gc, mass, timestep, n_steps, n_gyro_phases, gyro_shift, lost_st, lost_phi, gyro_phase, wall_status, locator_retries)
 use nodes_elements
+use mod_pusher_tools, only: GC_GEOMETRY_INVALID
 use mod_find_rz_nearby
 use mod_fields, only: fields_base
+use mod_boundary, only: wall_normal_vector
+use mod_interp, only: interp_RZ
+use phys_module, only: find_RZ_nearby_iter
+use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
 implicit none
 class(fields_base)     :: fields
 type(particle_gc_vpar) :: particle_gc
@@ -436,6 +483,9 @@ integer, intent(in)    :: n_gyro_phases ! number of gyro phases for gyro-averagi
 real*8, intent(out), optional :: gyro_shift(3) ! shift of the gyro centre from guiding centre
 ! Optional wall metadata; leave accepted particle state and legacy callers unchanged.
 real*8, intent(out), optional :: lost_st(2), lost_phi
+! Status follows the existing RK stage-loss convention; it is not a located event time.
+integer, optional, intent(out) :: wall_status, locator_retries
+real*8, intent(in), optional :: gyro_phase ! Controlled quadrature offset; absent uses production RNG.
 
 real*8 :: A_0(3), dA_0(3,3), B_0(3), dB_0(3,3), bn_0, dbn_0(3), Bnorm_0(3), dBnorm_0(3,3), E_0(3)
 real*8 :: A_1(3), dA_1(3,3), B_1(3), dB_1(3,3), bn_1, dbn_1(3), Bnorm_1(3), dBnorm_1(3,3), E_1(3)
@@ -448,6 +498,9 @@ real*8 :: delta_u1, delta_u2, delta_u3, delta_u4, qom, p_phi, energy
 type(particle_gc_vpar) :: p_0, p_1, p_2, p_3
 type(particle_kinetic_leapfrog), allocatable  :: p_orbit(:) 
 integer :: i, ifail, n_phases
+
+if(present(wall_status))wall_status=GC_STEP_VALID
+if(present(locator_retries))locator_retries=0
 
 qom = particle_gc%q * EL_CHG / (mass * ATOMIC_MASS_UNIT) 
 
@@ -472,7 +525,8 @@ call copy_particle_gc_vpar(particle_gc,p_3)
 call fields%calc_RK4(time_0, p_0%i_elm, p_0%st, p_0%x(3), A_0, dA_0, B_0, dB_0, Bnorm_0, dBnorm_0, bn_0, dbn_0, E_0)
 !call fields%calc_RK4_analytic(p_0%x(1), p_0%x(2), p_0%x(3), A_0, dA_0, B_0, dB_0, Bnorm_0, dBnorm_0, bn_0, dbn_0, E_0)
 
-call convert_gc_vpar_to_kinetic(node_list, element_list, p_0, B_0, mass, n_gyro_phases, p_orbit, ifail)
+call convert_gc_vpar_to_kinetic(node_list, element_list, p_0, B_0, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
+if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
 call fields%calc_gyro_average_E(time_0, p_orbit, n_gyro_phases, E_0)
 
 do i =1, n_steps
@@ -482,10 +536,18 @@ do i =1, n_steps
   p_1%x    = p_0%x    + 0.5d0 * timestep * delta_x1
   p_1%vpar = p_0%vpar + 0.5d0 * timestep * delta_u1
 
-  call find_RZ_nearby(node_list, element_list, p_0%x(1), p_0%x(2), p_0%st(1), p_0%st(2), p_0%i_elm, &
+  call locate_rk_stage( p_0%x(1), p_0%x(2), p_0%st(1), p_0%st(2), p_0%i_elm, &
                                                p_1%x(1), p_1%x(2), p_1%st(1), p_1%st(2), p_1%i_elm, ifail)
                                                
   if (p_1%i_elm .le. 0) then
+    if(p_1%i_elm==0)then
+      if(present(wall_status))then
+        wall_status=GC_NUMERICAL_FAILURE
+        return ! original accepted particle and loss metadata remain intact
+      endif
+      error stop 'Unresolved GC RK4 locator failure; particle retained'
+    endif
+    if(present(wall_status))wall_status=GC_WALL_LOSS
     particle_gc%i_elm = p_1%i_elm
     if (present(lost_st)) lost_st = p_1%st
     if (present(lost_phi)) lost_phi = p_1%x(3)
@@ -495,7 +557,8 @@ do i =1, n_steps
   call fields%calc_RK4(time_1, p_1%i_elm, p_1%st, p_1%x(3), A_1, dA_1, B_1, dB_1, Bnorm_1, dBnorm_1, bn_1, dbn_1, E_1)
  !call fields%calc_RK4_analytic(p_1%x(1), p_1%x(2), p_1%x(3), A_1, dA_1, B_1, dB_1, Bnorm_1, dBnorm_1, bn_1, dbn_1, E_1)
 
-  call convert_gc_vpar_to_kinetic(node_list, element_list, p_1, B_1, mass, n_gyro_phases, p_orbit, ifail)
+  call convert_gc_vpar_to_kinetic(node_list, element_list, p_1, B_1, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
+if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
   call fields%calc_gyro_average_E(time_0, p_orbit, n_gyro_phases, E_1)
   
   call rk4_step(p_1%x, p_1%vpar, qom, p_1%mu, E_1, B_1, Bnorm_1, dBnorm_1, dBn_1, delta_x2, delta_u2)
@@ -503,9 +566,17 @@ do i =1, n_steps
   p_2%x    = p_0%x    + 0.5d0 * timestep * delta_x2
   p_2%vpar = p_0%vpar + 0.5d0 * timestep * delta_u2
 
-  call find_RZ_nearby(node_list, element_list, p_0%x(1), p_0%x(2), p_0%st(1), p_0%st(2), p_0%i_elm, &
+  call locate_rk_stage( p_0%x(1), p_0%x(2), p_0%st(1), p_0%st(2), p_0%i_elm, &
                                                p_2%x(1), p_2%x(2), p_2%st(1), p_2%st(2), p_2%i_elm, ifail)
   if (p_2%i_elm .le. 0) then
+    if(p_2%i_elm==0)then
+      if(present(wall_status))then
+        wall_status=GC_NUMERICAL_FAILURE
+        return ! original accepted particle and loss metadata remain intact
+      endif
+      error stop 'Unresolved GC RK4 locator failure; particle retained'
+    endif
+    if(present(wall_status))wall_status=GC_WALL_LOSS
     particle_gc%i_elm = p_2%i_elm
     if (present(lost_st)) lost_st = p_2%st
     if (present(lost_phi)) lost_phi = p_2%x(3)
@@ -515,7 +586,8 @@ do i =1, n_steps
   call fields%calc_RK4(time_2, p_2%i_elm, p_2%st, p_2%x(3), A_2, dA_2, B_2, dB_2, Bnorm_2, dBnorm_2, bn_2, dbn_2, E_2)
  !call fields%calc_RK4_analytic(p_2%x(1), p_2%x(2), p_2%x(3), A_2, dA_2, B_2, dB_2, Bnorm_2, dBnorm_2, bn_2, dbn_2, E_2)
             
-  call convert_gc_vpar_to_kinetic(node_list, element_list, p_2, B_2, mass, n_gyro_phases, p_orbit, ifail)
+  call convert_gc_vpar_to_kinetic(node_list, element_list, p_2, B_2, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
+if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
   call fields%calc_gyro_average_E(time_0, p_orbit, n_gyro_phases, E_2)
 
   call rk4_step(p_2%x, p_2%vpar, qom, p_2%mu, E_2, B_2, Bnorm_2, dBnorm_2, dBn_2, delta_x3, delta_u3)
@@ -523,10 +595,18 @@ do i =1, n_steps
   p_3%x    = p_0%x    + timestep * delta_x3
   p_3%vpar = p_0%vpar + timestep * delta_u3
 
-  call find_RZ_nearby(node_list, element_list, p_0%x(1), p_0%x(2), p_0%st(1), p_0%st(2), p_0%i_elm, &
+  call locate_rk_stage( p_0%x(1), p_0%x(2), p_0%st(1), p_0%st(2), p_0%i_elm, &
                                                p_3%x(1), p_3%x(2), p_3%st(1), p_3%st(2), p_3%i_elm, ifail)
 
   if (p_3%i_elm .le. 0) then
+    if(p_3%i_elm==0)then
+      if(present(wall_status))then
+        wall_status=GC_NUMERICAL_FAILURE
+        return ! original accepted particle and loss metadata remain intact
+      endif
+      error stop 'Unresolved GC RK4 locator failure; particle retained'
+    endif
+    if(present(wall_status))wall_status=GC_WALL_LOSS
     particle_gc%i_elm = p_3%i_elm
     if (present(lost_st)) lost_st = p_3%st
     if (present(lost_phi)) lost_phi = p_3%x(3)
@@ -536,7 +616,8 @@ do i =1, n_steps
   call fields%calc_RK4(time_3, p_3%i_elm, p_3%st, p_3%x(3), A_3, dA_3, B_3, dB_3, Bnorm_3, dBnorm_3, bn_3, dbn_3, E_3)
  !call fields%calc_RK4_analytic(p_3%x(1), p_3%x(2), p_3%x(3), A_3, dA_3, B_3, dB_3, Bnorm_3, dBnorm_3, bn_3, dbn_3, E_3)
     
-  call convert_gc_vpar_to_kinetic(node_list, element_list, p_3, B_3, mass, n_gyro_phases, p_orbit, ifail)
+  call convert_gc_vpar_to_kinetic(node_list, element_list, p_3, B_3, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
+if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
   call fields%calc_gyro_average_E(time_0, p_orbit, n_gyro_phases, E_3)
 
   call rk4_step(p_3%x, p_3%vpar, qom, p_3%mu, E_3, B_3, Bnorm_3, dBnorm_3, dBn_3, delta_x4, delta_u4)
@@ -544,11 +625,19 @@ do i =1, n_steps
   p_0%x    = p_0%x    + timestep * (delta_x1 + 2.d0*delta_x2 + 2.d0*delta_x3 + delta_x4)/6.d0
   p_0%vpar = p_0%vpar + timestep * (delta_u1 + 2.d0*delta_u2 + 2.d0*delta_u3 + delta_u4)/6.d0
 
-  call find_RZ_nearby(node_list, element_list, &
+  call locate_rk_stage( &
                       particle_gc%x(1), particle_gc%x(2), particle_gc%st(1), particle_gc%st(2), particle_gc%i_elm, &
                       p_0%x(1),  p_0%x(2),  p_0%st(1),  p_0%st(2),  p_0%i_elm, ifail)
 
   if (p_0%i_elm .le. 0) then
+    if(p_0%i_elm==0)then
+      if(present(wall_status))then
+        wall_status=GC_NUMERICAL_FAILURE
+        return ! original accepted particle and loss metadata remain intact
+      endif
+      error stop 'Unresolved GC RK4 locator failure; particle retained'
+    endif
+    if(present(wall_status))wall_status=GC_WALL_LOSS
     particle_gc%i_elm = p_0%i_elm
     if (present(lost_st)) lost_st = p_0%st
     if (present(lost_phi)) lost_phi = p_0%x(3)
@@ -560,7 +649,8 @@ enddo
 call fields%calc_RK4(time_0, p_0%i_elm, p_0%st, p_0%x(3), A_0, dA_0, B_0, dB_0, Bnorm_0, dBnorm_0, bn_0, dbn_0, E_0)
 
 if (present(gyro_shift)) then
-  call convert_gc_vpar_to_kinetic(node_list, element_list, p_0, B_0, mass, n_gyro_phases, p_orbit, ifail)
+  call convert_gc_vpar_to_kinetic(node_list, element_list, p_0, B_0, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
+if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
   call fields%calc_gyro_average_E(time_0, p_orbit, n_gyro_phases, E_0)
   gyro_shift = (E_0 - dot_product(E_0,B_0)*B_0/bn_0**2) / bn_0**2 * mass*ATOMIC_MASS_UNIT / EL_CHG
 endif
@@ -570,7 +660,55 @@ p_0%B_norm = norm2(B_0)
 call copy_particle_gc_vpar(p_0,particle_gc)
 
 return
-end
+contains
+! Retry the identical RK trial, with the same origin and geometry, only when
+! the ordinary locator is unresolved. No RK force, timestep or RNG is repeated.
+subroutine locate_rk_stage(ro,zo,so,to,eo,r,z,s,t,e,status)
+real*8,intent(in)::ro,zo,so,to,r,z
+integer,intent(in)::eo
+real*8,intent(out)::s,t
+integer,intent(out)::e,status
+integer::budget,side,next
+real*8::wall(2),normal(3),tol
+logical::valid_wall
+call find_RZ_nearby(node_list,element_list,ro,zo,so,to,eo,r,z,s,t,e,status)
+if(e/=0)return
+! 16 -> 32 -> 64 in COMPASS. Larger configured defaults are not reduced.
+do budget=1,2
+  if(present(locator_retries))locator_retries=locator_retries+1
+  call find_RZ_nearby(node_list,element_list,ro,zo,so,to,eo,r,z,s,t,e,status, &
+                      iteration_limit=max(16,find_RZ_nearby_iter)*2**budget)
+  if(e>0)return
+  if(e<0)then
+    ! Verify that negative metadata names an actual wall face. This retains
+    ! the existing RK stage-loss model, not an exact trajectory intersection.
+    valid_wall=.false.;tol=128.d0*epsilon(1.d0)
+    if(-e>element_list%n_elements.or..not.all(ieee_is_finite([s,t])))exit
+    if(min(s,t)<-tol.or.max(s,t)>1.d0+tol)exit
+    do side=1,4
+      next=mod(side,4)+1
+      if(element_list%element(-e)%neighbours(side)/=0)cycle
+      if(node_list%node(element_list%element(-e)%vertex(side))%boundary<=0.or. &
+         node_list%node(element_list%element(-e)%vertex(next))%boundary<=0)cycle
+      select case(side)
+      case(1);valid_wall=valid_wall.or.abs(t)<=tol
+      case(2);valid_wall=valid_wall.or.abs(s-1.d0)<=tol
+      case(3);valid_wall=valid_wall.or.abs(t-1.d0)<=tol
+      case(4);valid_wall=valid_wall.or.abs(s)<=tol
+      end select
+    enddo
+    if(.not.valid_wall)exit
+    call interp_RZ(node_list,element_list,-e,s,t,wall(1),wall(2))
+    normal=wall_normal_vector(node_list,element_list,-e,s,t)
+    if(.not.all(ieee_is_finite([wall,normal])).or.norm2(normal)<=0.d0)exit
+    if(dot_product([r,z]-wall,normal(:2))>tol*max(1.d0,norm2(wall)))exit
+    return
+  endif
+enddo
+e=0;status=999
+end subroutine locate_rk_stage
+end subroutine push_gc_rk4
+
 
 function cross(A,B) result(AcrossB)
 implicit none

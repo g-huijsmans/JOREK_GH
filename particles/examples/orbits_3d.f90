@@ -2,6 +2,7 @@
 program orbits
 
 use particle_tracer
+use mod_orbits_3d_geometry_test, only: run_orbits_geometry_test
 use mpi
 use mod_atomic_elements
 use mod_particle_io
@@ -61,9 +62,16 @@ integer   :: ifail, n_part_phi, n_particles_local
 integer   :: i, j, n_steps, n_phases, in
 integer   :: seed, i_rng, n_stream, ierr, n_particle_out
 character*14 :: fileout, filepart
+character(len=64) :: test_mode
 type(particle_gc_vpar) :: p_gc, p_check_gc, p_gc2
 type(particle_gc)      :: p_Emu
 type(particle_kinetic_leapfrog), allocatable :: p_orbit(:)
+
+! The original conservation example remains the default.
+call get_command_argument(1,test_mode)
+if (trim(test_mode)=='--geometry-tests') then
+  call run_orbits_geometry_test()
+else
 
 call sim%initialize(num_groups=4)
 
@@ -421,6 +429,7 @@ call sim%finalize
 close(111)
 close(112)
 
+endif
 contains
 
     

@@ -75,6 +75,14 @@ module phys_module
   integer :: n_tor_restart        !< Number of toroidal harmonics read in the restart file
 #if JOREK_MODEL == 011
   logical :: reflect_gk_neutrals = .false. !< Elastic diffuse wall model, dedicated GK-neutral main only
+  logical :: use_gk_neutral_ionization = .false. !< Dedicated GK Stage 1; never enables ncs/ics.
+  integer :: n_update_ionization_profiles = 10
+  logical :: gk_ionization_diagnostics = .false.
+  character(len=16) :: gk_ionization_outside_gc_action = 'abort'
+  logical :: gk_ionization_rejection_diagnostics = .false.
+  character(len=8) :: gk_ionization_adas_suffix = '12_h'
+  character(len=96) :: gk_ionization_adas_directory = '' !< Include trailing slash; empty means cwd.
+
 #endif
   logical :: restart              !< Restart a code run from the restart file jorek_restart.h5?
   logical :: regrid               !< Re-generate the flux-aligned grid (does not work currently)?
