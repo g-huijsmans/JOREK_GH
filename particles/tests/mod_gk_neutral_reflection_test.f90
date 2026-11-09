@@ -1068,15 +1068,15 @@ end subroutine
 subroutine interior_endpoint_geometry_cases()
   type(particle_kinetic_leapfrog) :: source,endpoint
   type(side_correction) :: hit
-  integer :: which,start,neighbour
+  integer :: which,start,neighbour,j
   real*8 :: alpha,expected_lambda
-  do which=1,8
+  do which=1,10
     alpha=0.d0;if(which==2) alpha=0.2d0
     call recovery_mesh(alpha)
     source%x=[1.25d0,0.1d0,7.3d0];source%v=[-10000.d0,500.d0,10000.d0]
     if(which==2) then ! Both endpoints inside, but a physical exit precedes re-entry.
       source%x=[2.52d0,-0.8d0,7.3d0];source%v=[0.d0,16000.d0,0.d0]
-    else if(which==3.or.which==4) then
+    else if(which==3.or.which==4.or.which==9.or.which==10) then
       source%x=[1.25d0,-0.25d0,7.3d0];source%v=[10000.d0,10000.d0,0.d0]
       if(which==4) source%v(2)=10000.d0*(1.d0+1.d-5)
     else if(which==5.or.which==6) then
@@ -1084,9 +1084,22 @@ subroutine interior_endpoint_geometry_cases()
       if(which==6) source%v(2)=0.1d0/dt
     endif
     call analytic_location(source,alpha);start=source%i_elm
+    if(which==10)then
+      ! The same internal-vertex flight in a thin mesh must use the local cap.
+      do j=1,nodes%n_nodes
+        nodes%node(j)%x(:,:,2)=nodes%node(j)%x(:,:,2)*1.d-5
+      enddo
+      source%x(2)=source%x(2)*1.d-5;source%v(2)=source%v(2)*1.d-5
+    endif
     if(which==7) then
       neighbour=elements%element(start)%neighbours(4)
       elements%element(start)%neighbours(4)=elements%n_elements+1
+    endif
+    if(which==9)then
+      ! Shared endpoints/IDs are insufficient: alter the interior tangent of
+      ! the next cell without changing the starting cell or vertex positions.
+      neighbour=elements%element(start)%neighbours(2)
+      elements%element(neighbour)%size(1,3)=1.01d0*elements%element(neighbour)%size(1,3)
     endif
     if(which==8) source%v(1)=nan_value
     endpoint=source;call push_gk_neutral_ballistic(endpoint,dt)
@@ -1102,8 +1115,21 @@ subroutine interior_endpoint_geometry_cases()
       call assert_equals(WALL_CROSSING,hit%status,'interior endpoint does not override earlier physical exit')
       call assert_equals(expected_lambda,hit%lambda,1.d-11,'first wall crossing before re-entry')
       call assert_true(endpoint%x(1)<2.5d0+alpha*endpoint%x(2)**2,'exit/re-entry endpoint is inside')
-    case(3,7,8)
-      call assert_equals(UNRESOLVED,hit%status,'ambiguous corner, invalid connectivity or nonfinite state rejects')
+    case(3)
+      ! This straight Cartesian flight crosses only internal vertices of the
+      ! rectangular mesh; its entire path lies strictly within the outer wall.
+      call assert_equals(INTERIOR_ENDPOINT,hit%status,'shared internal vertex is not a physical wall')
+      call assert_true(hit%local_clusters>0,'internal vertex resolved by local tolerance cluster')
+      call assert_equals(2.25d0,endpoint%x(1),1.d-14,'analytic vertex-path endpoint R')
+      call assert_equals(.75d0,endpoint%x(2),1.d-14,'analytic vertex-path endpoint Z')
+      call assert_true(hit%max_residual<1.d-10,'vertex-path endpoint FE reconstruction')
+    case(10)
+      call assert_equals(INTERIOR_ENDPOINT,hit%status,'thin-cell vertex remains an interior flight')
+      call assert_true(hit%local_clusters>0,'thin-cell local cluster used')
+      call assert_true(hit%cluster_tolerance>0.d0.and.hit%cluster_tolerance<5.1d-8,'one-percent thickness caps 1um budget')
+      call assert_true(hit%cluster_extent<hit%cluster_tolerance,'cluster search stays within capped budget')
+    case(7,8,9)
+      call assert_equals(UNRESOLVED,hit%status,'invalid connectivity or nonfinite state rejects')
       call assert_true(len_trim(hit%reason)>0,'unresolved geometry has a reason')
     case(4,5,6)
       call assert_equals(INTERIOR_ENDPOINT,hit%status,'unambiguous near corner or near/exact face endpoint')
