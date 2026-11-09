@@ -5,12 +5,13 @@ contains
 
   subroutine element_matrix(element, nodes, xpoint2, xcase2, R_axis, Z_axis, psi_axis, psi_bnd, &
                             R_xpoint, Z_xpoint, ELM, RHS, tid, i_tor_min, i_tor_max, aux_nodes)
+    use mod_axis_treatment, only: axis_transform_matrix
     use constants,                  only: ATOMIC_MASS_UNIT, EL_CHG, MU_ZERO
     use mod_parameters,            only: n_vertex_max, n_degrees, var_psi, var_rho, var_T
     use data_structure,            only: type_element, type_node
     use gauss,                     only: n_gauss, wgauss
     use basis_at_gaussian,         only: H, H_s, H_t, H_ss, H_st, H_tt
-    use phys_module,               only: F0, central_mass, filter_gk_hyper, filter_gk_par, &
+    use phys_module,               only: treat_axis, F0, central_mass, filter_gk_hyper, filter_gk_par, &
                                          filter_gk_hyper_n0, filter_gk_par_n0, mode, mode_type, &
                                          central_density
     use mod_poisson_element_kernel, only: accumulate_poisson_n0_block, &
@@ -29,6 +30,8 @@ contains
     real*8, dimension(:,:), allocatable      :: ELM
     real*8, dimension(:), allocatable        :: RHS
 
+    real*8 :: axis_basis(4,4,6),P_axis(4,4)
+    integer :: iv,component
     integer, parameter :: basis_size = n_vertex_max*n_degrees
     integer            :: i, j, ms, mt, a, n_tor_local
     real*8             :: xjac, xjac_x, xjac_y, big_r, bb2, factor, weight
@@ -101,6 +104,36 @@ contains
         factor = central_mass*ATOMIC_MASS_UNIT*rho/(EL_CHG*bb2)
         psi_norm = (psi_g-psi_axis)/(psi_bnd-psi_axis)
         filter_par_centre = 0.d0
+
+        if(treat_axis.and.any(nodes(:)%axis_node))then
+          ! Transform before products and combine shared local copies. This is
+          ! algebraically P^T A P, but avoids subtracting singular axis blocks.
+          axis_basis(:,:,1)=reshape(value,[4,4])
+          axis_basis(:,:,2)=reshape(deriv_s,[4,4])
+          axis_basis(:,:,3)=reshape(deriv_t,[4,4])
+          axis_basis(:,:,4)=reshape(deriv_ss,[4,4])
+          axis_basis(:,:,5)=reshape(deriv_st,[4,4])
+          axis_basis(:,:,6)=reshape(deriv_tt,[4,4])
+          do iv=1,4,3
+            if(.not.nodes(iv)%axis_node)cycle
+            call axis_transform_matrix(nodes(iv),0.d0,P_axis)
+            do component=1,6
+              axis_basis(:,iv,component)=matmul(transpose(P_axis),axis_basis(:,iv,component))
+            enddo
+          enddo
+          do j=1,4
+            if(nodes(1)%axis_node.and.nodes(4)%axis_node.and.nodes(1)%index(j)==nodes(4)%index(j))then
+              axis_basis(j,1,:)=axis_basis(j,1,:)+axis_basis(j,4,:)
+              axis_basis(j,4,:)=0.d0
+            endif
+          enddo
+          value=reshape(axis_basis(:,:,1),[basis_size])
+          deriv_s=reshape(axis_basis(:,:,2),[basis_size])
+          deriv_t=reshape(axis_basis(:,:,3),[basis_size])
+          deriv_ss=reshape(axis_basis(:,:,4),[basis_size])
+          deriv_st=reshape(axis_basis(:,:,5),[basis_size])
+          deriv_tt=reshape(axis_basis(:,:,6),[basis_size])
+        endif
 
         do a = 1, basis_size
           deriv_x(a) = ( y_t*deriv_s(a)-y_s*deriv_t(a))/xjac

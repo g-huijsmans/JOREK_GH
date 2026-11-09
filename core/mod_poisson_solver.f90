@@ -37,6 +37,7 @@ contains
 
   !> Set up mode-family communicators, harmonic structure, and global vectors.
   subroutine setup_poisson_solver(this, mhd_sim, comm)
+    use mod_axis_treatment, only: validate_shared_axis_indices
     use mod_preconditioner, only: initialize_preconditioner
 #ifdef DIRECT_CONSTRUCTION
     use mod_direct_construction, only: setup_pc_structure
@@ -47,6 +48,7 @@ contains
     integer, intent(in)                        :: comm
     integer                                    :: n_global
 
+    call validate_shared_axis_indices(mhd_sim%node_list)
     if (this%setup_done) return
 
 #ifndef DIRECT_CONSTRUCTION

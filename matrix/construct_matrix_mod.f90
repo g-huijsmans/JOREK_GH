@@ -366,6 +366,8 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
   integer, allocatable              :: i_harm(:)
   integer                           :: comm, ierr, counts
   
+  if(treat_axis.and.fix_axis_nodes)error stop 'treat_axis and fix_axis_nodes are mutually exclusive.'
+
   ! --- Timing call
   call r3_info_begin (r3_info_index_0, 'construct_matrix')
   
@@ -512,7 +514,7 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
      enddo
      if (.not. allocated(i_harm)) allocate(i_harm(n_tor_local))
      do i = a_mat%i_tor_min, a_mat%i_tor_max
-       i_harm(i) = i
+       i_harm(i-a_mat%i_tor_min+1) = i
      enddo
   endif
 
@@ -560,10 +562,14 @@ subroutine construct_matrix(mhd_sim, local_elms, n_local_elms, a_mat, rhs_vec, h
         a_mat%i_tor_min, a_mat%i_tor_max)
     endif
 
+#if JOREK_MODEL != 011
     ! Transform basis functions for the axis nodes. mhd_sim% will solve for new degrees of freedom at the axis.
     if(treat_axis .and. (nodes(1)%axis_node .or. nodes(2)%axis_node .or. nodes(3)%axis_node .or. nodes(4)%axis_node) ) then
       call transform_basis_for_axis_element(nodes, ielm, thread_struct(omp_tid)%ELM, thread_struct(omp_tid)%RHS, i_v, n_var, i_harm, n_tor_local)
     endif
+#else
+    ! model011 transforms the test/trial basis before quadrature in element_matrix.
+#endif
 
 #ifdef PRINT_ELM_RHS
     if (.not. harmonic_matrix) then

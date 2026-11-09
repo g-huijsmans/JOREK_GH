@@ -17,6 +17,8 @@ contains
     use data_structure, only: type_node_list, type_element_list, type_RHS
     use mod_parameters, only: n_tor, n_vertex_max, n_degrees
     use mpi_mod
+    use phys_module, only: treat_axis
+    use mod_axis_treatment, only: transform_projection_rhs_for_axis_element, validate_axis_options
     implicit none
 
     type(type_node_list), intent(in)    :: node_list
@@ -27,8 +29,10 @@ contains
     logical, intent(in), optional       :: global_reduce
     integer                             :: n_poloidal_dof, i_elm, iv, idof, itor
     integer                             :: inode, index_node, index_global, ierr
-    logical                             :: do_reduce
+    real*8 :: axis_rhs(n_degrees,n_vertex_max,n_tor)
+    logical                             :: do_reduce, axis_element
 
+    call validate_axis_options()
     if (size(element_rhs,1).ne.n_degrees .or. size(element_rhs,2).ne.n_vertex_max .or. &
         size(element_rhs,3).ne.element_list%n_elements .or. size(element_rhs,4).ne.n_tor) &
       error stop 'Invalid element-local projection RHS shape.'
@@ -45,6 +49,13 @@ contains
     rhs_global%val = 0.d0
 
     do i_elm = 1, element_list%n_elements
+      axis_element=.false.
+      if(treat_axis)axis_element=any(node_list%node(element_list%element(i_elm)%vertex)%axis_node)
+      if(axis_element)then
+        ! Explicit copy: (dof,vertex,element,harmonic) is not a contiguous per-element section.
+        axis_rhs=element_rhs(:,:,i_elm,:)
+        call transform_projection_rhs_for_axis_element(node_list,element_list%element(i_elm),i_elm,axis_rhs,n_tor)
+      endif
       do iv = 1, n_vertex_max
         inode = element_list%element(i_elm)%vertex(iv)
         do idof = 1, n_degrees
@@ -52,7 +63,11 @@ contains
           if (index_node.le.0) cycle
           do itor = 1, n_tor
             index_global = n_tor*(index_node-1)+itor
-            rhs_global%val(index_global) = rhs_global%val(index_global)+element_rhs(idof,iv,i_elm,itor)
+            if(axis_element)then
+              rhs_global%val(index_global) = rhs_global%val(index_global)+axis_rhs(idof,iv,itor)
+            else
+              rhs_global%val(index_global) = rhs_global%val(index_global)+element_rhs(idof,iv,i_elm,itor)
+            endif
           enddo
         enddo
       enddo
@@ -133,7 +148,8 @@ contains
     use mod_solve_sparse_projection, only: solve_sparse_projection_system
     use mod_particle_sim, only: particle_sim
     use mod_parameters, only: n_tor, n_vertex_max, n_degrees
-    use phys_module, only: n_aux_var
+    use phys_module, only: n_aux_var, treat_axis
+    use mod_axis_treatment, only: new_to_old_dofs_on_the_axis
     use data_structure, only: init_node, type_RHS
 
     use mpi_mod
@@ -150,6 +166,7 @@ contains
     integer :: index_large_i, inode, index
     real*8  :: t0, t1, ostart, oend, mmm(3), mmm2(3)
     real*8,  allocatable :: my_rhs(:,:), y_tmp(:)
+    real*8 :: y_node(n_degrees,n_tor+1), old_dofs(4)
     type(type_RHS) :: assembled_rhs
     integer, allocatable :: recv_counts(:), recv_disp(:)
     integer :: n_rhs, n_rhs_f, i_rhs, n_tor_local, i_tor_local, n_loc_n
@@ -311,6 +328,64 @@ contains
         
         do i=1,this%node_list%n_nodes
 
+          if(treat_axis)then
+          ! y_node(:,1:2): n=0 (and zonal/dummy) equation, y_node(:,i_tor+1:i_tor+2): harmonics i_tor, i_tor+1
+          offset = 2*this%n_dof * this%rhs_vec%nrhs
+
+          do k=1,n_degrees
+
+            index = this%node_list%node(i)%index(k)
+
+            i_glob1 = 2*(index-1) + 1 + 2*this%n_dof*(i_var-1)
+
+            y_node(k,1) = y_tmp(i_glob1)
+            y_node(k,2) = y_tmp(i_glob1+1)
+
+            do i_tor=2,n_tor,2
+
+              i_glob2 = 2*(index-1) + 1 + offset + 2*this%n_dof*(i_var-1) + (i_tor-2)*this%n_dof * this%rhs_vec%nrhs
+
+              y_node(k,i_tor+1) = y_tmp(i_glob2)
+              y_node(k,i_tor+2) = y_tmp(i_glob2+1)
+
+            end do
+
+          enddo    ! order
+
+          ! The axis nodes share the new dofs, transform them back to the old ones of this node
+          if (treat_axis .and. this%node_list%node(i)%axis_node) then
+            do i_tor=1,n_tor+1
+              call new_to_old_dofs_on_the_axis(this%node_list, i, y_node(1:4,i_tor), old_dofs)
+              y_node(1:4,i_tor) = old_dofs
+            enddo
+          endif
+
+          do k=1,n_degrees
+
+            if (this%do_zonal) then
+              this%node_list%node(i)%deltas(1,k,i_var) = y_node(k,1) + y_node(k,2) - this%node_list%node(i)%values(1,k, i_var)
+              this%node_list%node(i)%deltas(1,k,2)     = y_node(k,2)               - this%node_list%node(i)%values(1,k,     2)
+
+              this%node_list%node(i)%values(1,k,i_var) = y_node(k,1) + y_node(k,2)
+              this%node_list%node(i)%values(1,k,2)     = y_node(k,2)
+            else
+              this%node_list%node(i)%deltas(1,k,i_var) = y_node(k,1) - this%node_list%node(i)%values(1,   k, i_var)
+              this%node_list%node(i)%values(1,k,i_var) = y_node(k,1)
+            endif
+
+            do i_tor=2,n_tor,2
+
+              this%node_list%node(i)%deltas(i_tor,  k,i_var) = y_node(k,i_tor+1) - this%node_list%node(i)%values(i_tor,   k, i_var)
+              this%node_list%node(i)%deltas(i_tor+1,k,i_var) = y_node(k,i_tor+2) - this%node_list%node(i)%values(i_tor+1, k, i_var)
+
+              this%node_list%node(i)%values(i_tor,  k,i_var) = y_node(k,i_tor+1)
+              this%node_list%node(i)%values(i_tor+1,k,i_var) = y_node(k,i_tor+2)
+
+            end do
+
+          enddo    ! order
+
+          else
           do k=1,n_degrees
         
             index = this%node_list%node(i)%index(k)
@@ -344,6 +419,7 @@ contains
           
           enddo    ! order
           
+          endif
           ! Check for NaNs in the projection
           if (any(ieee_is_nan(this%node_list%node(i)%values(:,:,i_var))) .or. any(ieee_is_nan(this%node_list%node(i)%deltas(:,:,i_var)))) then
             found_nan = .true.
@@ -391,8 +467,10 @@ contains
                               this_mpi_comm_world, this_mpi_comm_n, this_mpi_comm_master,  &
                               a_mat, filter, filter_hyper, filter_parallel,            &
                               skip_factorisation, apply_dirichlet_condition_in)
-  use phys_module, only : F0, TWOPI, mode, fix_axis_nodes
+  use phys_module, only : F0, TWOPI, mode, fix_axis_nodes, treat_axis
   use data_structure
+  use mod_axis_treatment, only: transform_elm_for_axis_element, transform_rhs_for_axis_element, &
+       validate_shared_axis_indices, transform_projection_rhs_for_axis_element
   use basis_at_gaussian
   use mod_basisfunctions
   use mpi_mod
@@ -413,6 +491,9 @@ contains
   type (type_node)         :: nodes(n_vertex_max)
 
   real*8, allocatable      :: ELM(:,:)
+  real*8 :: RHS_axis(n_degrees,n_vertex_max)
+  real*8 :: axis_basis(n_degrees,n_vertex_max,6)
+  logical :: axis_element
   real*8     :: wgauss2(n_gauss)
   real*8, dimension(n_gauss,n_gauss) :: x_g,   x_s,   x_t,   x_ss,   x_tt,   x_st
   real*8, dimension(n_gauss,n_gauss) :: y_g,   y_s,   y_t,   y_ss,   y_tt,   y_st
@@ -428,6 +509,8 @@ contains
   logical    :: do_facto
 
   type (type_SP_MATRIX) :: a_mat  !< Projection matrix
+
+  call validate_shared_axis_indices(node_list)
 
   ! We need a separate communicator to be able to run multiple MUMPSes
   call MPI_Comm_dup(this_mpi_comm_n, MPI_COMM_MUMPS, ierr)
@@ -453,6 +536,8 @@ contains
       if (node_list%node(i)%boundary .eq. 9) nz_bnd = nz_bnd + 8
     enddo
   endif
+
+  if(treat_axis)nz_bnd=nz_bnd+2*count(node_list%node(1:node_list%n_nodes)%axis_node)
 
   ! Only perform the construction of the matrix on the host
   if (my_id_n .eq. 0) then
@@ -482,8 +567,8 @@ contains
     !$omp parallel do default(none) &
     !$omp shared(element_list, node_list, n_tor_local, i_tor_local,                       &
     !$omp        H, H_s, H_t, H_ss, H_st, H_tt, Hz, Hz_p, a_mat, wgauss2,                 &
-    !$omp        filter, filter_hyper, filter_parallel, F0, fix_axis_nodes, my_id_master) &
-    !$omp private(ELM, i_elm, element, i, j, k, l, ms, mt, in, im, mp,           &
+    !$omp        filter, filter_hyper, filter_parallel, F0, fix_axis_nodes, treat_axis, my_id_master) &
+    !$omp private(ELM, RHS_axis, axis_basis, axis_element, i_elm, element, i, j, k, l, ms, mt, in, im, mp,           &
     !$omp         x_g, x_s, x_t, x_ss, x_st, x_tt,                                      &
     !$omp         y_g, y_s, y_t, y_ss, y_st, y_tt,                                      &
     !$omp         psi_g, psi_s, psi_t, psi_ss, psi_tt, psi_st,                          &
@@ -502,6 +587,8 @@ contains
       do m=1,n_vertex_max
         call make_deep_copy_node(node_list%node(element%vertex(m)), nodes(m))
       enddo
+
+      axis_element=treat_axis.and.any(nodes(:)%axis_node)
 
       ! Set up gauss points in this element
       x_g = 0.d0;   x_s = 0.d0;   x_t = 0.d0;   x_ss = 0.d0;   x_st = 0.d0;   x_tt = 0.d0
@@ -543,6 +630,25 @@ contains
       do ms=1, n_gauss
         do mt=1, n_gauss
 
+          if(axis_element)then
+            do i=1,n_vertex_max
+              do j=1,n_degrees
+                axis_basis(j,i,:)=[H(i,j,ms,mt),H_s(i,j,ms,mt),H_t(i,j,ms,mt), &
+                     H_ss(i,j,ms,mt),H_tt(i,j,ms,mt),H_st(i,j,ms,mt)]*element%size(i,j)
+              enddo
+            enddo
+            call transform_projection_rhs_for_axis_element(node_list,element,i_elm,axis_basis,6)
+            ! Combine the two copies of each shared axis unknown before products.
+            ! Scattering these sums gives the same Galerkin matrix without cancellation
+            ! between singular, separately assembled axis-value basis functions.
+            do j=1,n_degrees
+              if(nodes(1)%axis_node.and.nodes(4)%axis_node.and.nodes(1)%index(j)==nodes(4)%index(j))then
+                axis_basis(j,1,:)=axis_basis(j,1,:)+axis_basis(j,4,:)
+                axis_basis(j,4,:)=0.d0
+              endif
+            enddo
+          endif
+
           wst = wgauss2(ms)*wgauss2(mt)
           xjac =  x_s(ms,mt)*y_t(ms,mt) - x_t(ms,mt)*y_s(ms,mt)
 
@@ -580,6 +686,16 @@ contains
                   v_tt = H_tt(i,j,ms,mt) * element%size(i,j) * HZ(im_index,mp)
                   v_st = H_st(i,j,ms,mt) * element%size(i,j) * HZ(im_index,mp)
 
+                  if(axis_element)then
+                    v=axis_basis(j,i,1) * HZ(im_index,mp)
+                    v_s=axis_basis(j,i,2) * HZ(im_index,mp)
+                    v_t=axis_basis(j,i,3) * HZ(im_index,mp)
+                    v_ss=axis_basis(j,i,4) * HZ(im_index,mp)
+                    v_tt=axis_basis(j,i,5) * HZ(im_index,mp)
+                    v_st=axis_basis(j,i,6) * HZ(im_index,mp)
+                    v_p=axis_basis(j,i,1)*HZ_p(im_index,mp)
+                  endif
+
                   v_x = (  y_t(ms,mt) * v_s - y_s(ms,mt) * v_t) / xjac
                   v_y = (- x_t(ms,mt) * v_s + x_s(ms,mt) * v_t) / xjac
 
@@ -616,6 +732,16 @@ contains
                         p_tt = h_tt(k,l,ms,mt) * element%size(k,l) * HZ(in_index,mp)
                         p_st = h_st(k,l,ms,mt) * element%size(k,l) * HZ(in_index,mp)
 
+                        if(axis_element)then
+                          p=axis_basis(l,k,1) * HZ(in_index,mp)
+                          p_s=axis_basis(l,k,2) * HZ(in_index,mp)
+                          p_t=axis_basis(l,k,3) * HZ(in_index,mp)
+                          p_ss=axis_basis(l,k,4) * HZ(in_index,mp)
+                          p_tt=axis_basis(l,k,5) * HZ(in_index,mp)
+                          p_st=axis_basis(l,k,6) * HZ(in_index,mp)
+                          p_p=axis_basis(l,k,1)*HZ_p(in_index,mp)
+                        endif
+
                         p_x = (  y_t(ms,mt) * p_s - y_s(ms,mt) * p_t) / xjac
                         p_y = (- x_t(ms,mt) * p_s + x_s(ms,mt) * p_t) / xjac
 
@@ -650,6 +776,8 @@ contains
           enddo
         enddo
       enddo
+
+      ! Axis basis and integration functional were transformed before quadrature.
 
       ! Save contribution of this element in MUMPS format
       do i=1,n_vertex_max
@@ -755,6 +883,20 @@ contains
 
     endif
 
+    ! Shared unused Cartesian-axis DOF; keep it constrained in each equation channel.
+    if(treat_axis)then
+      do i=1,node_list%n_nodes
+        if(.not.node_list%node(i)%axis_node)cycle
+        do k=1,2
+          index1=node_list%node(i)%index(4)
+          ilarge=ilarge+1
+          a_mat%irn(ilarge)=2*(index1-1)+k
+          a_mat%jcn(ilarge)=2*(index1-1)+k
+          a_mat%val(ilarge)=1.d12
+        enddo
+      enddo
+    endif
+
     nz_AA = ilarge
 
     a_mat%ng  = n_AA
@@ -775,8 +917,10 @@ contains
                                   filter, filter_hyper, filter_parallel,                       &
                                   integral_weights, skip_factorisation, do_zonal,              &
                                   apply_dirichlet_condition_in)
-  use phys_module, only : F0, TWOPI, fix_axis_nodes
+  use phys_module, only : F0, TWOPI, fix_axis_nodes, treat_axis
   use data_structure
+  use mod_axis_treatment, only: transform_elm_for_axis_element, transform_rhs_for_axis_element, &
+       validate_shared_axis_indices, transform_projection_rhs_for_axis_element
   use basis_at_gaussian
   use mod_basisfunctions
   use mpi_mod
@@ -799,6 +943,9 @@ contains
   type (type_node)         :: nodes(n_vertex_max)
 
   real*8, allocatable      :: ELM(:,:)
+  real*8 :: RHS_axis(n_degrees,n_vertex_max)
+  real*8 :: axis_basis(n_degrees,n_vertex_max,6)
+  logical :: axis_element
   real*8     :: wgauss2(n_gauss)
   real*8, dimension(n_gauss,n_gauss) :: x_g,   x_s,   x_t,   x_ss,   x_tt,   x_st
   real*8, dimension(n_gauss,n_gauss) :: y_g,   y_s,   y_t,   y_ss,   y_tt,   y_st
@@ -816,6 +963,8 @@ contains
   real*8, dimension(n_vertex_max,n_degrees) :: basisfunction_volume
 
   type (type_SP_MATRIX) :: a_mat  !< Projection matrix
+
+  call validate_shared_axis_indices(node_list)
 
   ! We need a separate communicator to be able to run multiple MUMPSes
   call MPI_Comm_dup(this_mpi_comm_n, MPI_COMM_MUMPS, ierr)
@@ -846,6 +995,8 @@ contains
       if (node_list%node(i)%boundary .eq. 9) nz_bnd = nz_bnd + 8
     enddo
   endif
+
+  if(treat_axis)nz_bnd=nz_bnd+2*count(node_list%node(1:node_list%n_nodes)%axis_node)
 
   ! Only perform the construction of the matrix on the host
   if (my_id_n .eq. 0) then
@@ -887,8 +1038,8 @@ contains
     !$omp        apply_dirichlet_condition, zonal_factor, apply_zonal,                    &
     !$omp        H, H_s, H_t, H_ss, H_st, H_tt, Hz, Hz_p, a_mat, wgauss2,                 &
     !$omp        filter_n0, filter_hyper_n0, filter_parallel_n0, integral_weights, F0,    &
-    !$omp        fix_axis_nodes, my_id_master)                                            &
-    !$omp private(ELM, i_elm, element, i, j, k, l, ms, mt, in, im, mp,                    &
+    !$omp        fix_axis_nodes, treat_axis, my_id_master)                                            &
+    !$omp private(ELM, RHS_axis, axis_basis, axis_element, i_elm, element, i, j, k, l, ms, mt, in, im, mp,                    &
     !$omp         x_g, x_s, x_t, x_ss, x_st, x_tt,                                        &
     !$omp         y_g, y_s, y_t, y_ss, y_st, y_tt,                                        &
     !$omp         psi_g, psi_s, psi_t, psi_ss, psi_tt, psi_st,                            &
@@ -907,6 +1058,8 @@ contains
       do m=1,n_vertex_max
         call make_deep_copy_node(node_list%node(element%vertex(m)), nodes(m))
       enddo
+
+      axis_element=treat_axis.and.any(nodes(:)%axis_node)
 
       ! Set up gauss points in this element
       x_g = 0.d0;   x_s = 0.d0;   x_t = 0.d0;   x_ss = 0.d0;   x_st = 0.d0;   x_tt = 0.d0
@@ -951,6 +1104,25 @@ contains
       do ms=1, n_gauss
         do mt=1, n_gauss
 
+          if(axis_element)then
+            do i=1,n_vertex_max
+              do j=1,n_degrees
+                axis_basis(j,i,:)=[H(i,j,ms,mt),H_s(i,j,ms,mt),H_t(i,j,ms,mt), &
+                     H_ss(i,j,ms,mt),H_tt(i,j,ms,mt),H_st(i,j,ms,mt)]*element%size(i,j)
+              enddo
+            enddo
+            call transform_projection_rhs_for_axis_element(node_list,element,i_elm,axis_basis,6)
+            ! Combine the two copies of each shared axis unknown before products.
+            ! Scattering these sums gives the same Galerkin matrix without cancellation
+            ! between singular, separately assembled axis-value basis functions.
+            do j=1,n_degrees
+              if(nodes(1)%axis_node.and.nodes(4)%axis_node.and.nodes(1)%index(j)==nodes(4)%index(j))then
+                axis_basis(j,1,:)=axis_basis(j,1,:)+axis_basis(j,4,:)
+                axis_basis(j,4,:)=0.d0
+              endif
+            enddo
+          endif
+
           wst = wgauss2(ms)*wgauss2(mt)
           xjac =  x_s(ms,mt)*y_t(ms,mt) - x_t(ms,mt)*y_s(ms,mt)
 
@@ -985,6 +1157,15 @@ contains
               v_tt = H_tt(i,j,ms,mt) * element%size(i,j)
               v_st = H_st(i,j,ms,mt) * element%size(i,j)
 
+              if(axis_element)then
+                v=axis_basis(j,i,1)
+                v_s=axis_basis(j,i,2)
+                v_t=axis_basis(j,i,3)
+                v_ss=axis_basis(j,i,4)
+                v_tt=axis_basis(j,i,5)
+                v_st=axis_basis(j,i,6)
+              endif
+
               v_x = (  y_t(ms,mt) * v_s - y_s(ms,mt) * v_t) / xjac
               v_y = (- x_t(ms,mt) * v_s + x_s(ms,mt) * v_t) / xjac
 
@@ -1016,6 +1197,15 @@ contains
                   p_ss = h_ss(k,l,ms,mt) * element%size(k,l)
                   p_tt = h_tt(k,l,ms,mt) * element%size(k,l)
                   p_st = h_st(k,l,ms,mt) * element%size(k,l)
+
+                  if(axis_element)then
+                    p=axis_basis(l,k,1)
+                    p_s=axis_basis(l,k,2)
+                    p_t=axis_basis(l,k,3)
+                    p_ss=axis_basis(l,k,4)
+                    p_tt=axis_basis(l,k,5)
+                    p_st=axis_basis(l,k,6)
+                  endif
 
                   p_x = (  y_t(ms,mt) * p_s - y_s(ms,mt) * p_t) / xjac
                   p_y = (- x_t(ms,mt) * p_s + x_s(ms,mt) * p_t) / xjac
@@ -1074,6 +1264,8 @@ contains
         enddo
       enddo
 
+      ! Axis basis and integration functional were transformed before quadrature.
+
       ! Save contribution of this element in MUMPS format
       do i=1,n_vertex_max
 
@@ -1083,7 +1275,13 @@ contains
 
           index_rhs = 2*(node_list%node(inode)%index(j)-1) + 1   ! base index in the main matrix
 
+          if(treat_axis)then
+            ! Shared Cartesian axis indices receive contributions from many elements.
+            !$omp atomic update
+            integral_weights(index_rhs) = integral_weights(index_rhs) + basisfunction_volume(i,j)
+          else
           integral_weights(index_rhs) = integral_weights(index_rhs) + basisfunction_volume(i,j)
+          endif
 
           do im =1, 2
         
@@ -1179,6 +1377,20 @@ contains
         endif
       enddo
 
+    endif
+
+    ! Shared unused Cartesian-axis DOF; keep it constrained in each equation channel.
+    if(treat_axis)then
+      do i=1,node_list%n_nodes
+        if(.not.node_list%node(i)%axis_node)cycle
+        do k=1,2
+          index1=node_list%node(i)%index(4)
+          ilarge=ilarge+1
+          a_mat%irn(ilarge)=2*(index1-1)+k
+          a_mat%jcn(ilarge)=2*(index1-1)+k
+          a_mat%val(ilarge)=1.d12
+        enddo
+      enddo
     endif
 
     nz_AA = ilarge

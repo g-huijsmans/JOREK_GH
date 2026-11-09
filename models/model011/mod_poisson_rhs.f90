@@ -34,7 +34,8 @@ contains
                                   charge_nodes, charge_variable, rhs_global)
     use mpi_mod
     use mod_parameters, only: n_vertex_max, n_degrees, n_tor, n_plane, n_var
-    use phys_module, only: central_density, mode, mode_type
+    use phys_module, only: central_density, mode, mode_type, treat_axis
+    use mod_axis_treatment, only: transform_projection_rhs_for_axis_element, validate_shared_axis_indices
     use data_structure, only: type_node_list, type_element_list, type_RHS
     use gauss, only: n_gauss, wgauss
     use basis_at_gaussian, only: H, H_s, H_t
@@ -49,10 +50,12 @@ contains
     real*8, allocatable                :: rhs_local(:)
     real*8                             :: value(basis_size), charge(basis_size,n_tor)
     real*8                             :: load_mass(basis_size,basis_size), element_rhs(basis_size,n_tor)
+    real*8 :: axis_rhs(n_degrees,n_vertex_max,n_tor)
     real*8                             :: x_s, x_t, y_s, y_t, big_r, xjac, weight
     integer                            :: ife, ielm, i, j, a, ms, mt, inode, idof, itor
     integer                            :: index_node, index_global, ierr
 
+    call validate_shared_axis_indices(node_list)
     if (n_var.ne.1) error stop 'model011 Poisson RHS assembly requires n_var=1.'
     if (n_local_elms.gt.size(local_elms)) error stop 'Invalid local Poisson element list.'
     if (charge_variable.lt.1 .or. charge_variable.gt.charge_nodes%n_values) &
@@ -107,6 +110,11 @@ contains
 
       call apply_poisson_load_harmonics(load_mass,charge,mode,mode_type,n_plane, &
                                         central_density*1.d20,element_rhs)
+      if(treat_axis)then
+        axis_rhs=reshape(element_rhs,shape(axis_rhs))
+        call transform_projection_rhs_for_axis_element(node_list,element_list%element(ielm),ielm,axis_rhs,n_tor)
+        element_rhs=reshape(axis_rhs,shape(element_rhs))
+      endif
       do i = 1, n_vertex_max
         inode = element_list%element(ielm)%vertex(i)
         do idof = 1, n_degrees
