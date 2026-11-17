@@ -8,6 +8,7 @@ use mod_gk_neutral_trajectory, only: validate_neutral_start_coordinates, boundar
 use mod_gk_gc_boundary
 use mod_particle_types, only: particle_gc_vpar, particle_kinetic_leapfrog, codify_particle_type
 use mod_find_rz_nearby, only: find_RZ_nearby
+use phys_module, only: find_RZ_nearby_iter, find_RZ_nearby_tol
 use mod_math_operators, only: cross_product
 use mod_interp, only: interp_RZP
 use constants, only: ATOMIC_MASS_UNIT, EL_CHG
@@ -30,6 +31,11 @@ end type
 type :: gc_boundary_evidence
   integer :: locator_status=0,locator_element=0,source_winding=-99,gc_winding=-99
   integer :: wall_element=0,wall_side=0,reason=0
+  ! Validation code is independent of wall-policy classification and locator status.
+  integer :: validation_code=0,position_detail=0
+  logical :: have_source_B=.false.,have_gc_B=.false.,have_velocity=.false.,have_energy=.false.
+  real*8 :: source_B(3)=0.d0,gc_B(3)=0.d0,gc_st(2)=0.d0
+  real*8 :: vpar=0.d0,mu=0.d0,v2=0.d0,perp2=0.d0,source_energy=0.d0,ion_energy=0.d0
   real*8 :: gc_x(3)=0.d0,source_distance(2)=-1.d0,gc_distance(2)=-1.d0
 end type
 real*8, parameter :: energy_tolerance=128.d0*epsilon(1.d0)
@@ -391,18 +397,24 @@ subroutine stage_transaction(sim,state,registry,indices,time,ions,electrons,ion_
   error=0
 end subroutine
 
-logical function valid_position(sim,x,st,element) result(valid)
+logical function valid_position(sim,x,st,element,detail) result(valid)
   class(particle_sim), intent(in) :: sim
   real*8, intent(in) :: x(3),st(2)
   integer, intent(in) :: element
   real*8 :: r,z
+  integer,optional,intent(out)::detail
   valid=.false.
+  if(present(detail))detail=1
   if(element<=0.or.element>sim%fields%element_list%n_elements) return
+  if(present(detail))detail=2
   if(.not.all(ieee_is_finite(x)).or..not.all(ieee_is_finite(st))) return
+  if(present(detail))detail=3
   if(x(1)<=0.d0.or.any(st<0.d0).or.any(st>1.d0)) return
+  if(present(detail))detail=4
   call interp_RZP(sim%fields%node_list,sim%fields%element_list,element,st(1),st(2),x(3),r,z)
   ! Consistency tolerance follows the mesh locator, not the energy tolerance.
   valid=all(ieee_is_finite([r,z])).and.maxval(abs(x(:2)-[r,z]))<=1.d-8*max(1.d0,abs(r),abs(z))
+  if(valid.and.present(detail))detail=0
 end function
 
 subroutine magnetic_field(sim,time,x,st,element,B,Bnorm,error)
@@ -452,18 +464,30 @@ subroutine preflight_gk_ionization(sim,state,source,time,geometry,prepared,class
   type(particle_kinetic_leapfrog),optional,intent(in)::original
   integer::error
   classification=GC_ERROR
+  evidence=gc_boundary_evidence()
+  evidence%validation_code=10
   if(.not.state%initialized)return
+  evidence%validation_code=11
   if(.not.allocated(sim%fields).or..not.allocated(sim%groups))return
+  evidence%validation_code=12
   if(.not.associated(sim%fields%node_list).or..not.associated(sim%fields%element_list))return
+  evidence%validation_code=13
   if(any([state%ion_group,state%electron_group,state%neutral_group]<1).or. &
      any([state%ion_group,state%electron_group,state%neutral_group]>size(sim%groups)))return
+  evidence%validation_code=14
   if(.not.all(ieee_is_finite(sim%groups([state%ion_group,state%electron_group,state%neutral_group])%mass)))return
+  evidence%validation_code=15
   if(any(sim%groups([state%ion_group,state%electron_group,state%neutral_group])%mass<=0.d0))return
+  evidence%validation_code=16
   if(.not.ieee_is_finite(time).or.abs(time)>real(huge(0.e0),8))return
+  evidence%validation_code=17
   if(source%q/=0.or..not.ieee_is_finite(source%weight).or.source%weight<=0.d0)return
+  evidence%validation_code=18
   if(.not.all(ieee_is_finite(source%v)))return
-  if(.not.valid_position(sim,source%x,source%st,source%i_elm))return
+  evidence%validation_code=19
+  if(.not.valid_position(sim,source%x,source%st,source%i_elm,evidence%position_detail))return
   if(present(original))then
+    evidence%validation_code=30
     call validate_reaction_source(sim,original,source,error)
     if(error/=0)return
   endif
@@ -474,6 +498,7 @@ subroutine preflight_gk_ionization(sim,state,source,time,geometry,prepared,class
   prepared%groups=[state%ion_group,state%electron_group,state%neutral_group]
   prepared%masses=sim%groups(prepared%groups)%mass
   prepared%valid=.true.
+  evidence%validation_code=0
 end subroutine
 
 subroutine classify_gc_exit(sim,source,ion,ifail,geometry,classification,evidence)
@@ -483,11 +508,12 @@ subroutine classify_gc_exit(sim,source,ion,ifail,geometry,classification,evidenc
   integer,intent(in)::ifail
   type(gc_boundary_geometry),intent(in)::geometry
   integer,intent(out)::classification
-  type(gc_boundary_evidence),intent(out)::evidence
+  type(gc_boundary_evidence),intent(inout)::evidence
   logical::ok,sides(4)
   integer::e,s,unused_element,unused_side
   real*8::distance(4)
   classification=GC_ERROR;evidence%reason=1
+  evidence%validation_code=40
   evidence%gc_x=ion%x;evidence%locator_status=ifail;evidence%locator_element=ion%i_elm
   ! A numerical/non-wall locator failure is NEVER downgraded, even if a separate
   ! point classifier could place its coordinates outside.
@@ -504,11 +530,14 @@ subroutine classify_gc_exit(sim,source,ion,ifail,geometry,classification,evidenc
   s=findloc(sides.and.distance<=128.d0*epsilon(1.d0),.true.,dim=1)
   if(sim%fields%element_list%element(e)%neighbours(s)/=0)return
   evidence%reason=2
+  evidence%validation_code=41
   call boundary_winding(geometry,source%x(:2),evidence%source_winding,ok)
   if(.not.ok.or.evidence%source_winding/=1)return
+  evidence%validation_code=42
   call boundary_winding(geometry,ion%x(:2),evidence%gc_winding,ok)
   if(.not.ok.or.evidence%gc_winding/=0)return
   classification=GC_OUTSIDE_PHYSICAL_DOMAIN;evidence%reason=3
+  evidence%validation_code=43
   call boundary_distance_bounds(geometry,source%x(:2),evidence%source_distance(1), &
     evidence%source_distance(2),unused_element,unused_side)
   call boundary_distance_bounds(geometry,ion%x(:2),evidence%gc_distance(1), &
@@ -525,34 +554,60 @@ subroutine stage_products(sim,state,source,time,ion,electron,en,ei,error,geometr
   integer, intent(out) :: error
   type(gc_boundary_geometry),optional,intent(in)::geometry
   integer,optional,intent(out)::classification
-  type(gc_boundary_evidence),optional,intent(out)::evidence
-  integer :: ifail
+  type(gc_boundary_evidence),optional,intent(inout)::evidence
+  integer :: ifail,position_detail
+  logical :: position_ok
   real*8 :: B(3),Bnorm,b0(3),v2,perp2,displacement(3),radial,mi,mn
   error=1
   if(present(classification))classification=GC_ERROR
+  if(present(evidence))evidence%validation_code=20
   call magnetic_field(sim,time,source%x,source%st,source%i_elm,B,Bnorm,ifail)
+  if(present(evidence))then
+    evidence%source_B=B;evidence%have_source_B=ifail==0
+  endif
   if(ifail/=0) return
   mi=sim%groups(state%ion_group)%mass*ATOMIC_MASS_UNIT
   mn=sim%groups(state%neutral_group)%mass*ATOMIC_MASS_UNIT
   b0=B/Bnorm; v2=dot_product(source%v,source%v)
   ion%vpar=dot_product(source%v,b0); perp2=v2-ion%vpar**2
+  if(present(evidence))then
+    evidence%validation_code=21;evidence%vpar=ion%vpar;evidence%v2=v2;evidence%perp2=perp2
+    evidence%have_velocity=.true.
+  endif
   if(.not.ieee_is_finite(v2).or..not.ieee_is_finite(perp2)) return
+  if(present(evidence))evidence%validation_code=22
   if(perp2 < -32.d0*epsilon(v2)*max(v2,tiny(v2))) return
   perp2=max(0.d0,perp2)
   ! Invalid source energy is an error even when its prospective GC is outside.
   en=0.5d0*mn*v2*source%weight
+  if(present(evidence))then
+    evidence%validation_code=23;evidence%source_energy=en
+  endif
   if(.not.ieee_is_finite(en))return
   ! Preserve the shared JOREK kinetic-to-GC sign in its (R,Z,phi) component order.
   displacement=mi*cross_product(source%v,b0)/(EL_CHG*Bnorm)
   radial=source%x(1)+displacement(1)
   ion%x=[norm2([radial,displacement(3)]),source%x(2)+displacement(2), &
          source%x(3)+atan2(displacement(3),radial)]
+  if(present(evidence))then
+    evidence%validation_code=24;evidence%gc_x=ion%x
+  endif
   if(.not.all(ieee_is_finite(ion%x)).or.ion%x(1)<=0.d0) return
   call find_RZ_nearby(sim%fields%node_list,sim%fields%element_list,source%x(1),source%x(2), &
                      source%st(1),source%st(2),source%i_elm,ion%x(1),ion%x(2), &
                      ion%st(1),ion%st(2),ion%i_elm,ifail,phi=ion%x(3))
+  if(present(geometry))then
+    if(ion%i_elm<=0)call recover_product_location(sim,source,ion,ifail,geometry)
+  endif
+  if(present(evidence))then
+    evidence%validation_code=25;evidence%locator_status=ifail
+    evidence%locator_element=ion%i_elm;evidence%gc_st=ion%st
+  endif
   ! Current finite-Larmor-radius boundary limitation: both source and GC must be inside.
-  if(ifail/=0.or.ion%i_elm<=0) then
+  ! find_RZ_nearby returns 2/3 after a SUCCESSFUL global fallback. These are
+  ! inside-location outcomes, not wall exits. Keep the independent position,
+  ! finite-field and energy validation below; all other statuses still reject.
+  if((ifail/=0.and.ifail/=2.and.ifail/=3).or.ion%i_elm<=0) then
     if(present(geometry).and.present(classification).and.present(evidence))then
       call classify_gc_exit(sim,source,ion,ifail,geometry,classification,evidence)
       return
@@ -562,9 +617,18 @@ subroutine stage_products(sim,state,source,time,ion,electron,en,ei,error,geometr
       time,source%i_elm,ion%i_elm,ifail,source%x,source%v,source%st,B,displacement,ion%x
     return
   endif
-  if(.not.valid_position(sim,ion%x,ion%st,ion%i_elm)) return
+  position_ok=valid_position(sim,ion%x,ion%st,ion%i_elm,position_detail)
+  if(present(evidence))then
+    evidence%validation_code=26;evidence%position_detail=position_detail
+  endif
+  if(.not.position_ok) return
+  if(present(evidence))evidence%validation_code=27
   call magnetic_field(sim,time,ion%x,ion%st,ion%i_elm,B,ion%B_norm,ifail)
+  if(present(evidence))evidence%gc_B=B
   if(ifail/=0) return
+  if(present(evidence))then
+    evidence%gc_B=B;evidence%have_gc_B=.true.
+  endif
   ion%mu=perp2/(2.d0*ion%B_norm)
   ion%q=1; ion%weight=source%weight; ion%t_birth=real(time,4); ion%i_life=0
   ! Stage B2 must supply a physical secondary-electron energy model and remove
@@ -574,14 +638,64 @@ subroutine stage_products(sim,state,source,time,ion,electron,en,ei,error,geometr
   electron%B_norm=Bnorm; electron%t_birth=real(time,4); electron%i_life=0
   en=0.5d0*mn*v2*source%weight
   ei=mi*(0.5d0*ion%vpar**2+ion%mu*ion%B_norm)*source%weight
+  if(present(evidence))then
+    evidence%validation_code=28;evidence%vpar=ion%vpar;evidence%mu=ion%mu
+    evidence%source_energy=en;evidence%ion_energy=ei;evidence%have_energy=.true.
+  endif
   if(.not.all(ieee_is_finite([ion%vpar,ion%mu,en,ei]))) return
+  if(present(evidence))evidence%validation_code=29
   if(abs(ei-en)>energy_tolerance*max(en,ei,tiny(en))) then
     call reject(sim,state%ion_group,0,'ion/source kinetic-energy mismatch (128 epsilon relative tolerance)')
     return
   endif
   error=0
+  if(present(evidence))evidence%validation_code=0
   if(present(classification))classification=GC_VALID
 end subroutine
+
+! A GC conversion is a point transformation, not a physical orbit along the
+! locator's Newton path. Recover its location without changing the proposed x.
+subroutine recover_product_location(sim,source,ion,status,geometry)
+  class(particle_sim),intent(in)::sim
+  type(particle_kinetic_leapfrog),intent(in)::source
+  type(particle_gc_vpar),intent(inout)::ion
+  integer,intent(inout)::status
+  type(gc_boundary_geometry),intent(in)::geometry
+  integer::k,e,code,winding,side
+  real*8::st(2),r,z,rs,rt,rp,zs,zt,zp
+  logical::ok,sides(4)
+  real*8::distance(4)
+  if(ion%i_elm==0)then
+    do k=1,2
+      call find_RZ_nearby(sim%fields%node_list,sim%fields%element_list,source%x(1),source%x(2), &
+        source%st(1),source%st(2),source%i_elm,ion%x(1),ion%x(2),ion%st(1),ion%st(2),ion%i_elm,status, &
+        phi=ion%x(3),iteration_limit=max(16,find_RZ_nearby_iter)*2**k)
+      if(ion%i_elm/=0)exit
+    enddo
+  endif
+  if(ion%i_elm>=0.or.status/=-1.or..not.geometry%valid)return
+  ! A missing INTERNAL neighbour is a mesh defect, never a recoverable wall exit.
+  e=-ion%i_elm
+  if(e<1.or.e>sim%fields%element_list%n_elements)return
+  if(.not.all(ieee_is_finite(ion%st)))return
+  sides=boundary_sides(sim%fields%node_list,sim%fields%element_list,e)
+  distance=abs([ion%st(2),1.d0-ion%st(1),1.d0-ion%st(2),ion%st(1)])
+  if(count(sides.and.distance<=128.d0*epsilon(1.d0))/=1)return
+  side=findloc(sides.and.distance<=128.d0*epsilon(1.d0),.true.,dim=1)
+  if(sim%fields%element_list%element(e)%neighbours(side)/=0)return
+  call boundary_winding(geometry,ion%x(:2),winding,ok)
+  if(.not.ok.or.winding/=1)return
+  ! The independent CLOSED-wall classifier says inside. Require an actual
+  ! positive FE location, its usual residual, and a positive local Jacobian.
+  call find_RZ_nearby(sim%fields%node_list,sim%fields%element_list,source%x(1),source%x(2), &
+    source%st(1),source%st(2),0,ion%x(1),ion%x(2),st(1),st(2),e,code,phi=ion%x(3))
+  if(e<=0.or.(code/=0.and.code/=2.and.code/=3))return
+  if(.not.valid_position(sim,ion%x,st,e))return
+  call interp_RZP(sim%fields%node_list,sim%fields%element_list,e,st(1),st(2),ion%x(3),r,rs,rt,rp,z,zs,zt,zp)
+  if(.not.all(ieee_is_finite([r,rs,rt,z,zs,zt])).or.rs*zt-rt*zs<=0.d0)return
+  if(sum(([r,z]-ion%x(:2))**2)>find_RZ_nearby_tol)return
+  ion%i_elm=e;ion%st=st;status=code
+end subroutine recover_product_location
 
 subroutine report_gk_neutral_ionization(sim,state)
   class(particle_sim), intent(in) :: sim

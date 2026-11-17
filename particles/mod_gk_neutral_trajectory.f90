@@ -249,13 +249,14 @@ function boundary_sides(nodes,elements,e) result(sides)
 end function
 
 !> Explicit-side normal: same positive-Jacobian convention as wall_normal_vector.
-subroutine side_geometry(nodes,elements,e,side,u,st,wall,tangent,normal,ok)
+subroutine side_geometry(nodes,elements,e,side,u,st,wall,tangent,normal,ok,curve_endpoint)
   type(type_node_list), intent(in) :: nodes
   type(type_element_list), intent(in) :: elements
   integer, intent(in) :: e,side
   real*8, intent(in) :: u
   real*8, intent(out) :: st(2),wall(2),tangent(2),normal(3)
   logical, intent(out) :: ok
+  logical, optional, intent(in) :: curve_endpoint
   real*8 :: rs,rt,zs,zt,jac,length
   logical :: s_const
   st=0.d0; s_const=.false.
@@ -272,8 +273,45 @@ subroutine side_geometry(nodes,elements,e,side,u,st,wall,tangent,normal,ok)
   ok=all(ieee_is_finite([wall,tangent,normal,jac,length]))
   if(.not.ok) return
   ok=wall(1)>0.d0.and.jac>0.d0.and.length>0.d0
-  if(ok) normal=normal/length
+  if(ok) then
+    normal=normal/length
+  else if(present(curve_endpoint)) then
+    ! A collapsed internal axis edge has a perfectly defined cubic curve,
+    ! but no inverse Jacobian or normal at its endpoints. Only curve extraction
+    ! may use it. Every actual intersection still uses the strict call above.
+    if(curve_endpoint.and.jac==0.d0.and.wall(1)>0.d0) &
+      ok=collapsed_internal_endpoint(nodes,elements,e,wall)
+  endif
 end subroutine
+
+! Recognize the exact collapsed cubic edge, independently of field treatment.
+! No positional tolerance can turn a narrow edge into a collapsed one.
+logical function collapsed_internal_endpoint(nodes,elements,e,point) result(ok)
+  type(type_node_list),intent(in)::nodes
+  type(type_element_list),intent(in)::elements
+  integer,intent(in)::e
+  real*8,intent(in)::point(2)
+  real*8::st(2),p(2,2),d(2,2),rs,rt,zs,zt,r,z
+  integer::side,k,v(2)
+  logical::s_const
+  ok=.false.
+  do side=1,4
+    if(elements%element(e)%neighbours(side)/=-1)cycle
+    v=face_vertices(nodes,elements,e,side)
+    if(any([nodes%node(v(1))%boundary,nodes%node(v(2))%boundary]>0))cycle
+    do k=1,2
+      call get_st_on_bnd(real(k-1,8),side,st(1),st(2),s_const)
+      call interp_RZ(nodes,elements,e,st(1),st(2),p(1,k),rs,rt,p(2,k),zs,zt)
+      d(:,k)=[rs,zs];if(s_const)d(:,k)=[rt,zt]
+    enddo
+    if(.not.all(ieee_is_finite([p(:,1),p(:,2),d(:,1),d(:,2)])))cycle
+    if(any(p(:,1)/=point).or.any(p(:,2)/=point).or.any(d/=0.d0))cycle
+    ! A collapsed edge alone is not sufficient evidence of a valid cell.
+    call interp_RZ(nodes,elements,e,.5d0,.5d0,r,rs,rt,z,zs,zt)
+    ok=all(ieee_is_finite([r,z,rs,rt,zs,zt])).and.rs*zt-rt*zs>0.d0
+    return
+  enddo
+end function
 
 pure function polynomial(c,n,x) result(y)
   integer, intent(in) :: n
@@ -494,11 +532,11 @@ subroutine first_element_exit(nodes,elements,e,event,endpoint,dt,entry_fraction,
     hit%examined=hit%examined+1
     reason='boundary-node flags disagree with nonzero neighbour on candidate side'
     if(sides(side).and.elements%element(e)%neighbours(side)/=0) goto 800
-    call side_geometry(nodes,elements,e,side,0.d0,st,ends(:,1),derivs(:,1),normal,ok)
+    call side_geometry(nodes,elements,e,side,0.d0,st,ends(:,1),derivs(:,1),normal,ok,curve_endpoint=.true.)
     if(.not.ok) then
       reason='invalid candidate endpoint geometry'; goto 800
     endif
-    call side_geometry(nodes,elements,e,side,1.d0,st,ends(:,2),derivs(:,2),normal,ok)
+    call side_geometry(nodes,elements,e,side,1.d0,st,ends(:,2),derivs(:,2),normal,ok,curve_endpoint=.true.)
     if(.not.ok) then
       reason='invalid candidate endpoint geometry'; goto 800
     endif
@@ -676,14 +714,20 @@ function face_vertices(nodes,elements,e,side) result(vertices)
 end function
 
 ! Duplicate node IDs occur at COMPASS mesh seams. A cubic face is uniquely
-! determined by its two endpoints and endpoint tangents. Require EXACT agreement
-! of those physical data; proximity at the crossing alone never repairs topology.
+! determined by its two endpoints and endpoint tangents. Compare all four Hermite
+! data componentwise with a local roundoff allowance, never the wall tolerance.
+! At u=0/1 the cubic Hermite basis selects a single scaled nodal coefficient.
+! gamma32 bounds the 16-term multiply/sum evaluation and allows rounded copies
+! of those data. There is no absolute metre-scale floor. Reversal negates tangents.
+! Endpoint bounds plus tangent bounds bound the whole cubic difference through
+! |h00|+|h01|=1 and |h10|,|h11|<=4/27, not just the crossing point.
 logical function identical_cubic_faces(nodes,elements,e,side,next,entry_side,reversed) result(same)
   type(type_node_list), intent(in) :: nodes
   type(type_element_list), intent(in) :: elements
   integer, intent(in) :: e,side,next,entry_side
   logical, intent(in) :: reversed
   real*8 :: u,v,orientation,st(2),a(2),b(2),da(2),db(2),normal(3)
+  real*8,parameter :: gamma32=32.d0*epsilon(1.d0)/(1.d0-32.d0*epsilon(1.d0))
   integer :: k
   logical :: ok
   same=.false.;orientation=1.d0;if(reversed) orientation=-1.d0
@@ -694,7 +738,8 @@ logical function identical_cubic_faces(nodes,elements,e,side,next,entry_side,rev
     if(.not.ok) return
     call side_geometry(nodes,elements,next,entry_side,v,st,b,db,normal,ok)
     if(.not.ok) return
-    if(any(a/=b).or.any(da/=orientation*db)) return
+    if(any(abs(a-b)>gamma32*(abs(a)+abs(b)))) return
+    if(any(abs(da-orientation*db)>gamma32*(abs(da)+abs(db)))) return
   enddo
   same=.true.
 end function
