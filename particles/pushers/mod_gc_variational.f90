@@ -464,7 +464,9 @@ enddo
 return
 end
 
-subroutine push_gc_rk4(fields, particle_gc, mass, timestep, n_steps, n_gyro_phases, gyro_shift, lost_st, lost_phi, gyro_phase, wall_status, locator_retries)
+subroutine push_gc_rk4(fields, particle_gc, mass, timestep, n_steps, n_gyro_phases, gyro_shift, lost_st, lost_phi, gyro_phase, wall_status, locator_retries, &
+                       integration_substeps, start_time, failed_substep, failed_stage, stage_time, field_calls, &
+                       max_stage_distance, max_cell_distance, failure_reason)
 use nodes_elements
 use mod_pusher_tools, only: GC_GEOMETRY_INVALID
 use mod_find_rz_nearby
@@ -485,6 +487,11 @@ real*8, intent(out), optional :: gyro_shift(3) ! shift of the gyro centre from g
 real*8, intent(out), optional :: lost_st(2), lost_phi
 ! Status follows the existing RK stage-loss convention; it is not a located event time.
 integer, optional, intent(out) :: wall_status, locator_retries
+integer, intent(in), optional :: integration_substeps
+real*8, intent(in), optional :: start_time
+! Stage-loss diagnostics identify the RK trial, not a continuous first impact.
+integer, intent(out), optional :: failed_substep, failed_stage, field_calls, failure_reason
+real*8, intent(out), optional :: stage_time, max_stage_distance, max_cell_distance
 real*8, intent(in), optional :: gyro_phase ! Controlled quadrature offset; absent uses production RNG.
 
 real*8 :: A_0(3), dA_0(3,3), B_0(3), dB_0(3,3), bn_0, dbn_0(3), Bnorm_0(3), dBnorm_0(3,3), E_0(3)
@@ -495,12 +502,37 @@ real*8 :: x_0(3), x_1(3), x_2(3), x_3(3), u_0, u_1, u_2, u_3, time_0, time_1, ti
 real*8 :: delta_x1(3), delta_x2(3), delta_x3(3), delta_x4(3)
 real*8 :: delta_u1, delta_u2, delta_u3, delta_u4, qom, p_phi, energy
 
-type(particle_gc_vpar) :: p_0, p_1, p_2, p_3
+type(particle_gc_vpar) :: p_0, p_1, p_2, p_3, step_start
 type(particle_kinetic_leapfrog), allocatable  :: p_orbit(:) 
-integer :: i, ifail, n_phases
+integer :: i, ifail, n_phases, n_internal, total_steps, current_stage
+real*8 :: dt_gc, initial_time, current_time
 
 if(present(wall_status))wall_status=GC_STEP_VALID
 if(present(locator_retries))locator_retries=0
+
+if(present(failure_reason))failure_reason=0
+if(present(failed_substep))failed_substep=0
+if(present(failed_stage))failed_stage=0
+if(present(stage_time))stage_time=0.d0
+if(present(field_calls))field_calls=0
+if(present(max_stage_distance))max_stage_distance=0.d0
+if(present(max_cell_distance))max_cell_distance=0.d0
+n_internal=1
+if(present(integration_substeps))n_internal=integration_substeps
+initial_time=0.d0
+if(present(start_time))initial_time=start_time
+if(n_internal<1.or.n_steps<1.or..not.ieee_is_finite(timestep).or.timestep<0.d0.or. &
+   .not.ieee_is_finite(initial_time))then
+  if(present(failure_reason))failure_reason=1
+  if(present(wall_status))then
+    wall_status=GC_NUMERICAL_FAILURE
+    return
+  endif
+  error stop 'Invalid GC RK4 integration interval'
+endif
+if(n_steps>huge(total_steps)/n_internal)error stop 'GC RK4 substep count overflow'
+total_steps=n_steps*n_internal
+dt_gc=timestep/n_internal
 
 qom = particle_gc%q * EL_CHG / (mass * ATOMIC_MASS_UNIT) 
 
@@ -522,20 +554,29 @@ call copy_particle_gc_vpar(particle_gc,p_1)
 call copy_particle_gc_vpar(particle_gc,p_2)
 call copy_particle_gc_vpar(particle_gc,p_3)
 
+do i =1, total_steps
+  time_0=initial_time+(i-1)*dt_gc
+  time_1=time_0+0.5d0*dt_gc
+  time_2=time_1
+  time_3=time_0+dt_gc
+  step_start=p_0
+  current_stage=0;current_time=time_0
 call fields%calc_RK4(time_0, p_0%i_elm, p_0%st, p_0%x(3), A_0, dA_0, B_0, dB_0, Bnorm_0, dBnorm_0, bn_0, dbn_0, E_0)
+if(present(field_calls))field_calls=field_calls+1
 !call fields%calc_RK4_analytic(p_0%x(1), p_0%x(2), p_0%x(3), A_0, dA_0, B_0, dB_0, Bnorm_0, dBnorm_0, bn_0, dbn_0, E_0)
 
 call convert_gc_vpar_to_kinetic(node_list, element_list, p_0, B_0, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
 if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
 call fields%calc_gyro_average_E(time_0, p_orbit, n_gyro_phases, E_0)
 
-do i =1, n_steps
+
   
   call rk4_step(p_0%x, p_0%vpar, qom, p_0%mu, E_0, B_0, Bnorm_0, dBnorm_0, dBn_0, delta_x1, delta_u1)
 
-  p_1%x    = p_0%x    + 0.5d0 * timestep * delta_x1
-  p_1%vpar = p_0%vpar + 0.5d0 * timestep * delta_u1
+  p_1%x    = p_0%x    + 0.5d0 * dt_gc * delta_x1
+  p_1%vpar = p_0%vpar + 0.5d0 * dt_gc * delta_u1
 
+  current_stage=1;current_time=time_1
   call locate_rk_stage( p_0%x(1), p_0%x(2), p_0%st(1), p_0%st(2), p_0%i_elm, &
                                                p_1%x(1), p_1%x(2), p_1%st(1), p_1%st(2), p_1%i_elm, ifail)
                                                
@@ -555,17 +596,19 @@ do i =1, n_steps
   endif
     
   call fields%calc_RK4(time_1, p_1%i_elm, p_1%st, p_1%x(3), A_1, dA_1, B_1, dB_1, Bnorm_1, dBnorm_1, bn_1, dbn_1, E_1)
+if(present(field_calls))field_calls=field_calls+1
  !call fields%calc_RK4_analytic(p_1%x(1), p_1%x(2), p_1%x(3), A_1, dA_1, B_1, dB_1, Bnorm_1, dBnorm_1, bn_1, dbn_1, E_1)
 
   call convert_gc_vpar_to_kinetic(node_list, element_list, p_1, B_1, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
 if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
-  call fields%calc_gyro_average_E(time_0, p_orbit, n_gyro_phases, E_1)
+  call fields%calc_gyro_average_E(time_1, p_orbit, n_gyro_phases, E_1)
   
   call rk4_step(p_1%x, p_1%vpar, qom, p_1%mu, E_1, B_1, Bnorm_1, dBnorm_1, dBn_1, delta_x2, delta_u2)
 
-  p_2%x    = p_0%x    + 0.5d0 * timestep * delta_x2
-  p_2%vpar = p_0%vpar + 0.5d0 * timestep * delta_u2
+  p_2%x    = p_0%x    + 0.5d0 * dt_gc * delta_x2
+  p_2%vpar = p_0%vpar + 0.5d0 * dt_gc * delta_u2
 
+  current_stage=2;current_time=time_2
   call locate_rk_stage( p_0%x(1), p_0%x(2), p_0%st(1), p_0%st(2), p_0%i_elm, &
                                                p_2%x(1), p_2%x(2), p_2%st(1), p_2%st(2), p_2%i_elm, ifail)
   if (p_2%i_elm .le. 0) then
@@ -584,17 +627,19 @@ if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
   endif
   
   call fields%calc_RK4(time_2, p_2%i_elm, p_2%st, p_2%x(3), A_2, dA_2, B_2, dB_2, Bnorm_2, dBnorm_2, bn_2, dbn_2, E_2)
+if(present(field_calls))field_calls=field_calls+1
  !call fields%calc_RK4_analytic(p_2%x(1), p_2%x(2), p_2%x(3), A_2, dA_2, B_2, dB_2, Bnorm_2, dBnorm_2, bn_2, dbn_2, E_2)
             
   call convert_gc_vpar_to_kinetic(node_list, element_list, p_2, B_2, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
 if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
-  call fields%calc_gyro_average_E(time_0, p_orbit, n_gyro_phases, E_2)
+  call fields%calc_gyro_average_E(time_2, p_orbit, n_gyro_phases, E_2)
 
   call rk4_step(p_2%x, p_2%vpar, qom, p_2%mu, E_2, B_2, Bnorm_2, dBnorm_2, dBn_2, delta_x3, delta_u3)
 
-  p_3%x    = p_0%x    + timestep * delta_x3
-  p_3%vpar = p_0%vpar + timestep * delta_u3
+  p_3%x    = p_0%x    + dt_gc * delta_x3
+  p_3%vpar = p_0%vpar + dt_gc * delta_u3
 
+  current_stage=3;current_time=time_3
   call locate_rk_stage( p_0%x(1), p_0%x(2), p_0%st(1), p_0%st(2), p_0%i_elm, &
                                                p_3%x(1), p_3%x(2), p_3%st(1), p_3%st(2), p_3%i_elm, ifail)
 
@@ -614,19 +659,21 @@ if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
   endif
   
   call fields%calc_RK4(time_3, p_3%i_elm, p_3%st, p_3%x(3), A_3, dA_3, B_3, dB_3, Bnorm_3, dBnorm_3, bn_3, dbn_3, E_3)
+if(present(field_calls))field_calls=field_calls+1
  !call fields%calc_RK4_analytic(p_3%x(1), p_3%x(2), p_3%x(3), A_3, dA_3, B_3, dB_3, Bnorm_3, dBnorm_3, bn_3, dbn_3, E_3)
     
   call convert_gc_vpar_to_kinetic(node_list, element_list, p_3, B_3, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
 if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
-  call fields%calc_gyro_average_E(time_0, p_orbit, n_gyro_phases, E_3)
+  call fields%calc_gyro_average_E(time_3, p_orbit, n_gyro_phases, E_3)
 
   call rk4_step(p_3%x, p_3%vpar, qom, p_3%mu, E_3, B_3, Bnorm_3, dBnorm_3, dBn_3, delta_x4, delta_u4)
                                 
-  p_0%x    = p_0%x    + timestep * (delta_x1 + 2.d0*delta_x2 + 2.d0*delta_x3 + delta_x4)/6.d0
-  p_0%vpar = p_0%vpar + timestep * (delta_u1 + 2.d0*delta_u2 + 2.d0*delta_u3 + delta_u4)/6.d0
+  p_0%x    = p_0%x    + dt_gc * (delta_x1 + 2.d0*delta_x2 + 2.d0*delta_x3 + delta_x4)/6.d0
+  p_0%vpar = p_0%vpar + dt_gc * (delta_u1 + 2.d0*delta_u2 + 2.d0*delta_u3 + delta_u4)/6.d0
 
+  current_stage=4;current_time=time_3
   call locate_rk_stage( &
-                      particle_gc%x(1), particle_gc%x(2), particle_gc%st(1), particle_gc%st(2), particle_gc%i_elm, &
+                      step_start%x(1), step_start%x(2), step_start%st(1), step_start%st(2), step_start%i_elm, &
                       p_0%x(1),  p_0%x(2),  p_0%st(1),  p_0%st(2),  p_0%i_elm, ifail)
 
   if (p_0%i_elm .le. 0) then
@@ -646,7 +693,9 @@ if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
 
 enddo
 
+time_0=initial_time+n_steps*timestep
 call fields%calc_RK4(time_0, p_0%i_elm, p_0%st, p_0%x(3), A_0, dA_0, B_0, dB_0, Bnorm_0, dBnorm_0, bn_0, dbn_0, E_0)
+if(present(field_calls))field_calls=field_calls+1
 
 if (present(gyro_shift)) then
   call convert_gc_vpar_to_kinetic(node_list, element_list, p_0, B_0, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
@@ -656,21 +705,68 @@ if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
 endif
 
 p_0%B_norm = norm2(B_0)
+if(.not.all(ieee_is_finite([p_0%x,p_0%vpar,p_0%mu,p_0%B_norm])).or.p_0%B_norm<=0.d0)then
+  if(present(failure_reason))failure_reason=4
+  if(present(wall_status))then
+    wall_status=GC_NUMERICAL_FAILURE
+    return
+  endif
+  error stop 'Invalid GC RK4 final state; particle retained'
+endif
 
 call copy_particle_gc_vpar(p_0,particle_gc)
+if(present(failed_substep))failed_substep=0
+if(present(failed_stage))failed_stage=0
+if(present(stage_time))stage_time=initial_time+n_steps*timestep
 
 return
 contains
 ! Retry the identical RK trial, with the same origin and geometry, only when
 ! the ordinary locator is unresolved. No RK force, timestep or RNG is repeated.
+function current_phi() result(phi)
+real*8::phi
+select case(current_stage)
+case(1);phi=p_1%x(3)
+case(2);phi=p_2%x(3)
+case(3);phi=p_3%x(3)
+case default;phi=p_0%x(3)
+end select
+end function
+logical function finite_trial() result(valid)
+select case(current_stage)
+case(1);valid=all(ieee_is_finite([p_1%x,p_1%vpar]))
+case(2);valid=all(ieee_is_finite([p_2%x,p_2%vpar]))
+case(3);valid=all(ieee_is_finite([p_3%x,p_3%vpar]))
+case default;valid=all(ieee_is_finite([p_0%x,p_0%vpar]))
+end select
+end function
 subroutine locate_rk_stage(ro,zo,so,to,eo,r,z,s,t,e,status)
 real*8,intent(in)::ro,zo,so,to,r,z
 integer,intent(in)::eo
 real*8,intent(out)::s,t
 integer,intent(out)::e,status
 integer::budget,side,next
-real*8::wall(2),normal(3),tol
+real*8::wall(2),normal(3),tol, rr,zz,rs,rt,zs,zt,jac,ds,dt
 logical::valid_wall
+if(present(failed_substep))failed_substep=i
+if(present(failed_stage))failed_stage=current_stage
+if(present(stage_time))stage_time=current_time
+if(.not.finite_trial())then
+  if(present(failure_reason))failure_reason=2
+  e=0;status=999;s=so;t=to
+  return
+endif
+if(present(max_stage_distance))max_stage_distance=max(max_stage_distance,norm2([r*cos(current_phi())-ro*cos(step_start%x(3)), &
+  r*sin(current_phi())-ro*sin(step_start%x(3)),z-zo]))
+if(present(max_cell_distance))then
+  call interp_RZ(node_list,element_list,eo,so,to,rr,rs,rt,zz,zs,zt)
+  jac=rs*zt-rt*zs
+  if(ieee_is_finite(jac).and.jac>0.d0)then
+    ds=((r-ro)*zt-(z-zo)*rt)/jac
+    dt=((z-zo)*rs-(r-ro)*zs)/jac
+    max_cell_distance=max(max_cell_distance,max(abs(ds),abs(dt)))
+  endif
+endif
 call find_RZ_nearby(node_list,element_list,ro,zo,so,to,eo,r,z,s,t,e,status)
 if(e/=0)return
 ! 16 -> 32 -> 64 in COMPASS. Larger configured defaults are not reduced.
@@ -705,6 +801,7 @@ do budget=1,2
     return
   endif
 enddo
+if(present(failure_reason))failure_reason=3
 e=0;status=999
 end subroutine locate_rk_stage
 end subroutine push_gc_rk4
