@@ -202,7 +202,7 @@ namelist /in1/  reflect_gk_neutrals, use_gk_neutral_ionization, n_update_ionizat
                 tgnum_T, tgnum_Ti, tgnum_Te, tgnum_vpar, tgnum_rhon,&
                 tgnum_nre, tgnum_AR, tgnum_AZ, tgnum_A3,            &
                 tstep_particles, nstep_particles,                   &
-                nsubstep_particles, nsubstep_electrons,             &
+                nsubstep_particles, nsubstep_electrons, nsubstep_gc_electrons,             &
                 T_scale_factor, B_scale_factor,                     &
                 ei_small_angle_scattering_Orb5,                     &
                 ei_small_angle_scattering_Lu,                       &
