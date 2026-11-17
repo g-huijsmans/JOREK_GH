@@ -50,7 +50,7 @@ use basis_at_gaussian
 use mod_normalisations
 use phys_module, only: F0, tstep, nstep, nout, restart, rho_0, rho_1, rho_coef
 use phys_module, only: CENTRAL_MASS, CENTRAL_DENSITY, xcase, xpoint, index_now, index_start
-use phys_module, only: nstep_particles, nsubstep_particles, tstep_particles, nsubstep_electrons
+use phys_module, only: nstep_particles, nsubstep_particles, tstep_particles, nsubstep_electrons, nsubstep_gc_electrons
 use phys_module, only: part_group_configs, n_part_groups
 use phys_module, only: filter_perp, filter_hyper, filter_par, filter_perp_n0, filter_hyper_n0, filter_par_n0
 use phys_module, only: xtime, energies, mode, restart_particles, n_tht, n_leg
@@ -160,6 +160,10 @@ neutral_group  = 3
 call sim%initialize()  
 call tr_meminit(sim%my_id, sim%n_mpi)
 
+if (nsubstep_gc_electrons < 1) then
+  if(sim%my_id==0)write(*,*)'ERROR: nsubstep_gc_electrons must be at least one'
+  call MPI_ABORT(MPI_COMM_WORLD,1,ierr)
+endif
 if (nsubstep_electrons < 1) then
   if (sim%my_id == 0) write(*,*) 'ERROR: nsubstep_electrons must be at least one'
   call MPI_ABORT(MPI_COMM_WORLD, 1, ierr)
@@ -513,7 +517,7 @@ do i=1, nstep_particles
 
     call loop_particle_gc_local(sim, electron_group, 0,  ion_group, electron_group,           &
                                 jorek_feedback, project_profiles, project_density,            &
-                                tstep_electrons, nsubstep_particles, particle_start_time,     &
+                                tstep_electrons, nsubstep_particles, particle_start_time+(k-1)*tstep_electrons*nsubstep_particles,     &
                                 newly_lost_electrons, n_newly_lost_electrons, &
                                 energy_local_electrons,    energy_local_lost_electrons,       &
                                 momentum_local_electrons,  momentum_local_lost_electrons,     &
@@ -928,6 +932,7 @@ use mod_particle_types, only: particle_gc_vpar, particle_kinetic_leapfrog, copy_
 use mod_event
 use mod_pcg32_rng
 use mod_interp, only: mode_moivre, interp_RZ, interp_0
+use phys_module, only: nsubstep_gc_electrons
 use mod_gc_variational, only : convert_gc_vpar_to_kinetic, copy_particle_gc_vpar, push_gc_rk4, GC_NUMERICAL_FAILURE
 use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 use phys_module, only: F0, CENTRAL_MASS, CENTRAL_DENSITY, ei_small_angle_scattering_Orb5, ei_small_angle_scattering_Lu
@@ -1040,7 +1045,7 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
   !$omp n_orbit, central_density, central_mass, F0, i_group, electron_group,     &
   !$omp rng, lost, n_lost, ion_group,                                &
   !$omp ei_small_angle_scattering_Orb5, ei_small_angle_scattering_Lu,            &
-  !$omp project_profiles, project_density)                                       &
+  !$omp project_profiles, project_density, nsubstep_gc_electrons)                                       &
   !$omp private(gc_status, particle_tmp, i_rng, i,j,k,l,m, t, E, B, psi, U, rz_old, st_old, lost_st, lost_phi, &
   !$omp i_elm_old, i_elm, zn0, zne0, zni0, Te_eV, Te0_eV, Ti0_eV,                &
   !$omp p_orbit, ran1, ran2,                                                     & 
@@ -1064,7 +1069,9 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
     if (particle_tmp%i_elm .le. 0) already_lost = .true.
 
     call push_gc_rk4(sim%fields, particle_tmp, sim%groups(i_group)%mass, timesteps, n_steps, n_orbit, &
-                     lost_st=lost_st, lost_phi=lost_phi, wall_status=gc_status)
+                     lost_st=lost_st, lost_phi=lost_phi, wall_status=gc_status, &
+                     integration_substeps=merge(nsubstep_gc_electrons,1,i_group==electron_group), &
+                     start_time=particle_start_time)
     if(gc_status==GC_NUMERICAL_FAILURE)then
       gc_failures=gc_failures+1
       !$omp critical(gc_failure_report)
@@ -1107,6 +1114,29 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
 
     potential_energy_local = potential_energy_local + 0.5d0 * EL_CHG * particle_tmp%q * F0 * U * particle_tmp%weight  ! should be gyro-averaged
 
+    ! Drift-kinetic electron charge uses the accepted GC, as does its force.
+    ! No gyro conversion, location search or phase draw is needed for this load.
+    if (i_group == electron_group .and. n_orbit == 0) then
+      i_elm = particle_tmp%i_elm
+      call basisfunctions(particle_tmp%st(1), particle_tmp%st(2), HH, HH_s, HH_t)
+      call mode_moivre(particle_tmp%x(3), HHZ)
+      do l=1,n_vertex_max
+        do m=1,n_order+1
+
+          index_lm = (l-1)*(n_order+1) + m
+
+          v   = HH(l,m) * sim%fields%element_list%element(i_elm)%size(l,m) * particle_tmp%weight * particle_tmp%q * t_norm / F0
+
+          do i_tor=1,n_tor
+            feedback_rhs(m,l,i_elm,i_tor,1) = feedback_rhs(m,l,i_elm,i_tor,1) + HHZ(i_tor) * v
+          enddo
+
+        enddo   !< order
+      enddo     !< vertex
+      ! Collision profiles retain their existing gyro-point sampling below.
+      if (.not. (ei_small_angle_scattering_Lu .or. ei_small_angle_scattering_Orb5)) cycle
+    endif
+
     call convert_gc_vpar_to_kinetic(sim%fields%node_list, sim%fields%element_list, particle_tmp, B, sim%groups(i_group)%mass, n_phases, p_orbit, ifail)
         
     if (ifail .lt. 0) cycle
@@ -1142,6 +1172,7 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
       vpar_i0 = P6(5) / P6(1)
       vpar_e0 = P6(6) / P6(2)
 
+      if (.not. (i_group == electron_group .and. n_orbit == 0)) then
       do l=1,n_vertex_max
         do m=1,n_order+1
   
@@ -1155,6 +1186,7 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
 
         enddo   !< order
       enddo     !< vertex
+      endif
     enddo       !< phases
 
     if (i_group .eq. electron_group) then
