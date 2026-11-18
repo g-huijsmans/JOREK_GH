@@ -933,7 +933,9 @@ use mod_event
 use mod_pcg32_rng
 use mod_interp, only: mode_moivre, interp_RZ, interp_0
 use phys_module, only: nsubstep_gc_electrons
-use mod_gc_variational, only : convert_gc_vpar_to_kinetic, copy_particle_gc_vpar, push_gc_rk4, GC_NUMERICAL_FAILURE
+use mod_gc_variational, only : convert_gc_vpar_to_kinetic, copy_particle_gc_vpar, push_gc_rk4, GC_NUMERICAL_FAILURE, &
+    gyro_ring_result, RING_FAILURE, RING_VALID
+use mod_gk_gc_boundary, only: gc_boundary_geometry, build_gc_boundary_geometry
 use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 use phys_module, only: F0, CENTRAL_MASS, CENTRAL_DENSITY, ei_small_angle_scattering_Orb5, ei_small_angle_scattering_Lu
 use omp_lib
@@ -951,6 +953,9 @@ integer, intent(in)                           :: n_steps                    ! th
 logical, intent(in)                           :: update                     ! switch to update particle position (.true.) or calculate only rhs contribution to Poisson (not used currenly)
 integer, intent(inout)                        :: lost(:) ! transient newly-lost events only
 integer :: gc_status, gc_failures, gc_failures_global, gc_mpi_error
+type(gyro_ring_result) :: gyro_result
+type(gc_boundary_geometry), save :: gyro_boundary
+logical, save :: gyro_boundary_built=.false.
 integer                                       :: n_lost                     ! the current number of lost particles in lost array
 real*8                                        :: energy_local,    energy_lost_local   ! the energy and energy loss in this timestep [J]
 real*8                                        :: momentum_local,  momentum_lost_local ! momentum and momentum loss in this timeste [kg m/s] (?)
@@ -983,6 +988,11 @@ real*8    :: lost_st(2), lost_phi
 real*8    :: va_par, va_perp, va_par_out, va_perp_out, delta_E_ab, delta_P_ab, E_ab, P_ab
 type(pcg32_rng), dimension(:), allocatable :: rng
 
+! This runtime imports one immutable mesh before particle advancement.
+if(n_orbit>0.and..not.gyro_boundary_built)then
+  call build_gc_boundary_geometry(sim%fields%node_list,sim%fields%element_list,gyro_boundary)
+  gyro_boundary_built=.true.
+endif
 w0 = omp_get_wtime()
 retain_wall_metadata = recycling%enabled.and.i_group==ion_group
 
@@ -1040,13 +1050,13 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
   !$omp parallel do default(none) &
 #endif
   !$omp schedule(dynamic,10)                                                     &
-  !$omp shared(sim, particles, n_steps, timesteps, particle_start_time, update, retain_wall_metadata, &
+  !$omp shared(gyro_boundary, sim, particles, n_steps, timesteps, particle_start_time, update, retain_wall_metadata, &
   !$omp rho_norm, t_norm, v_norm, E_norm, M_norm, zn_norm, Tev_norm, n_phases,   &
   !$omp n_orbit, central_density, central_mass, F0, i_group, electron_group,     &
   !$omp rng, lost, n_lost, ion_group,                                &
   !$omp ei_small_angle_scattering_Orb5, ei_small_angle_scattering_Lu,            &
   !$omp project_profiles, project_density, nsubstep_gc_electrons)                                       &
-  !$omp private(gc_status, particle_tmp, i_rng, i,j,k,l,m, t, E, B, psi, U, rz_old, st_old, lost_st, lost_phi, &
+  !$omp private(gyro_result, gc_status, particle_tmp, i_rng, i,j,k,l,m, t, E, B, psi, U, rz_old, st_old, lost_st, lost_phi, &
   !$omp i_elm_old, i_elm, zn0, zne0, zni0, Te_eV, Te0_eV, Ti0_eV,                &
   !$omp p_orbit, ran1, ran2,                                                     & 
   !$omp P2, P3, P6, R_g, R_s, R_t, Z_g, Z_s, Z_t, xjac, HH, HH_s, HH_t, index_lm,&
@@ -1071,7 +1081,7 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
     call push_gc_rk4(sim%fields, particle_tmp, sim%groups(i_group)%mass, timesteps, n_steps, n_orbit, &
                      lost_st=lost_st, lost_phi=lost_phi, wall_status=gc_status, &
                      integration_substeps=merge(nsubstep_gc_electrons,1,i_group==electron_group), &
-                     start_time=particle_start_time)
+                     start_time=particle_start_time, gyro_boundary=gyro_boundary)
     if(gc_status==GC_NUMERICAL_FAILURE)then
       gc_failures=gc_failures+1
       !$omp critical(gc_failure_report)
@@ -1089,7 +1099,7 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
 !    call sim%fields%calc_EBpsiU(sim%time, particles(j)%i_elm, particles(j)%st, particles(j)%x(3), E, B, psi, U)
 
     if  (particle_tmp%i_elm .gt. 0)  then
-      call copy_particle_gc_vpar(particle_tmp, particles(j))
+      if(i_group/=ion_group)call copy_particle_gc_vpar(particle_tmp, particles(j))
     else
       call copy_particle_gc_vpar(particle_tmp, particles(j))
       if (.not. already_lost) then
@@ -1137,9 +1147,19 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
       if (.not. (ei_small_angle_scattering_Lu .or. ei_small_angle_scattering_Orb5)) cycle
     endif
 
-    call convert_gc_vpar_to_kinetic(sim%fields%node_list, sim%fields%element_list, particle_tmp, B, sim%groups(i_group)%mass, n_phases, p_orbit, ifail)
-        
-    if (ifail .lt. 0) cycle
+    call convert_gc_vpar_to_kinetic(sim%fields%node_list, sim%fields%element_list, particle_tmp, B, sim%groups(i_group)%mass, n_phases, p_orbit, ifail, &
+         ring_result=gyro_result, boundary_geometry=gyro_boundary)
+    if(gyro_result%classification==RING_FAILURE)then
+      gc_failures=gc_failures+1
+      !$omp critical(gc_failure_report)
+      write(*,*) 'Unresolved ion deposition ring rank/group/slot: ',sim%my_id,i_group,j
+      !$omp end critical(gc_failure_report)
+      cycle
+    endif
+    if(i_group==ion_group)call copy_particle_gc_vpar(particle_tmp,particles(j))
+    ! Interim policy: omit the WHOLE ring when any sampled point is confirmed
+    ! outside. This fixes the old order-dependent guard; it is not an FLR wall law.
+    if(gyro_result%classification/=RING_VALID)cycle
         
     n_valid_phases = 0
     v_par_sum  = 0.d0

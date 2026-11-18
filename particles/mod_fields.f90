@@ -5,6 +5,7 @@ module mod_fields
   implicit none
   private
   public fields_base
+  integer, parameter, public :: GYRO_AVERAGE_OK=0,GYRO_AVERAGE_EMPTY=1
 
 !> Base type for a field interpolator.
 !> Must implement the following interfaces, which are the normal
@@ -81,6 +82,8 @@ module mod_fields
       real*8,                   intent(out) :: R, R_s, R_t, R_phi, Z, Z_s, Z_t, Z_phi
     end subroutine interp_PRZP_1
   end interface
+
+public :: calc_gyro_average_E_common
 
 contains
 !> Calculates the electric and magnetic fields at a specific position
@@ -496,6 +499,7 @@ subroutine calc_gyro_average_E(fields, time, particles, n_phases, E_average)
   !!!!!!!!!!!!! careful Ptime is not yet defined !!!!!!!!!!!!!!!!!!!!!!
 
   if (n_phases .lt. 1) return   ! return E_average as it was
+  if(count(particles%i_elm>0)==0)error stop 'Empty gyroaverage; no electric field defined'
 
   t_norm  = sqrt(mu_zero * ATOMIC_MASS_UNIT * central_mass * central_density * 1.d20) ! 1 jorek time unit in seconds
 
@@ -536,6 +540,81 @@ subroutine calc_gyro_average_E(fields, time, particles, n_phases, E_average)
   E_average = E_average / real(n_average,8)
 
 end subroutine calc_gyro_average_E
+
+! Candidate: average physical vectors in the specified guiding-centre basis.
+subroutine calc_gyro_average_E_common(fields, time, particles, n_phases, E_average, reference_phi, status)
+  use phys_module, only: F0, mode, central_mass, central_density
+  use constants, only: mu_zero, atomic_mass_unit
+  use mod_coordinate_transforms, only: vector_rotation
+  use mod_particle_types
+  ! Routine parameters
+  class(fields_base), intent(in)             :: fields
+  real*8, intent(in)                         :: time
+  type(particle_kinetic_leapfrog),intent(in) :: particles(n_phases)
+  integer, intent(in)                        :: n_phases     ! the number of points used in the gyro orbit average
+  real*8, intent(inout)                      :: E_average(3) !< Electric field [V/m]
+  real*8, optional, intent(in) :: reference_phi
+  integer, optional, intent(out) :: status
+  ! Internal parameters
+  integer, parameter :: i_var(1) = [2]
+  real*8             :: P(1), P_s(1), P_t(1), P_phi(1), P_time(1) ! Placeholder for evaluating variables and derivatives locally
+  real*8             :: E(3), R, R_s, R_t, Z, Z_s, Z_t
+  real*8             :: inv_st_jac, R_inv
+  real*8             :: U, U_R, U_Z, U_phi, t_norm
+  integer            :: i, n_average
+
+  !!!!!!!!!!!!! careful Ptime is not yet defined !!!!!!!!!!!!!!!!!!!!!!
+
+  if(present(status))status=GYRO_AVERAGE_OK
+  if (n_phases .lt. 1) return   ! return E_average as it was
+  if(count(particles%i_elm>0)==0)then
+    if(present(status))then
+      status=GYRO_AVERAGE_EMPTY
+      return ! Keep supplied E unchanged; it is not a valid average.
+    endif
+    error stop 'Empty gyroaverage; no electric field defined'
+  endif
+
+  t_norm  = sqrt(mu_zero * ATOMIC_MASS_UNIT * central_mass * central_density * 1.d20) ! 1 jorek time unit in seconds
+
+  ! Interpolate the fields to get psi and U at the current position (and the
+  ! changes u_n - u(n-1))
+
+  E_average = 0.d0
+  n_average = 0
+
+  do i=1, n_phases
+
+    if (particles(i)%i_elm .le. 0) cycle
+
+    call fields%interp_PRZ(time, particles(i)%i_elm, i_var, 1, particles(i)%st(1), particles(i)%st(2), particles(i)%x(3), P, P_s, P_t, P_phi, P_time, R, R_s, R_t, Z, Z_s, Z_t)
+
+    P_time(1) = 0.d0
+
+    R_inv = 1.d0/R
+    inv_st_jac = 1.d0/jac(R_s,R_t,Z_s,Z_t)
+
+    ! Calculate the derivatives to R and Z
+    U_R      = (  P_s(1) * Z_t - P_t(1) * Z_s ) * inv_st_jac
+    U_Z      = (- P_s(1) * R_t + P_t(1) * R_s ) * inv_st_jac
+    U_phi    = P_phi(1)
+
+    U   = P(1)/t_norm
+
+    ! The local electric field, obtained from E=-Grad (u F0)-\partial_t A
+    ! See http://jorek.eu/wiki/doku.php?id=u_phi
+    E     = [-F0*U_R, -F0*U_Z, -F0*U_phi*R_inv]/t_norm
+    E(3)  = E(3) - R_inv*P_time(1) ! because this is not normalized with t_norm
+
+    if (present(reference_phi)) E = vector_rotation(E,particles(i)%x(3)-reference_phi)
+    E_average = E_average + E
+    n_average = n_average + 1
+
+  enddo
+
+  E_average = E_average / real(n_average,8)
+
+end subroutine calc_gyro_average_E_common
 
 !> Calculates the plasma velocity vector
 !the sum of vpar v_ExB

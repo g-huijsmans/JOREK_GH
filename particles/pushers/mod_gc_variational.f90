@@ -2,6 +2,8 @@
 !> This module contains routines for pushing particles in the RZPhi
 !>  (cylindrical) coordinate system. 
 module mod_gc_variational
+  use mod_fields, only: calc_gyro_average_E_common
+  use mod_gk_gc_boundary, only: gc_boundary_geometry, boundary_winding
   use mod_particle_types
   use constants, only: EL_CHG, ATOMIC_MASS_UNIT
   implicit none  
@@ -14,6 +16,18 @@ module mod_gc_variational
   integer, parameter :: GC_STEP_VALID=0, GC_WALL_LOSS=1, GC_NUMERICAL_FAILURE=2
   public convert_leapfrog_to_gc_vpar
   public convert_gc_to_gc_vpar
+! Gyro-point and ring statuses are distinct from GC step/loss statuses above.
+  integer, parameter :: GYRO_VALID=10, GYRO_FALLBACK=11, GYRO_OUTSIDE=12, GYRO_UNRESOLVED=13, GYRO_INVALID=14
+  integer, parameter :: RING_VALID=20, RING_PARTIAL_OUTSIDE=21, RING_OUTSIDE=22, RING_FAILURE=23
+  integer, parameter :: GYRO_LOCATION_FAILURE=-1002, GYRO_NOT_LOCATED=-1003
+  type :: gyro_point_result
+    integer :: classification=GYRO_INVALID, locator_status=GYRO_NOT_LOCATED, locator_element=0, element=0
+    real*8 :: locator_st(2)=0.d0
+    logical :: recovered=.false.
+  end type
+  type :: gyro_ring_result
+    integer :: classification=RING_FAILURE, n_valid=0, n_outside=0, n_unresolved=0, n_invalid=0, n_recovered=0
+  end type
 contains
 
 subroutine copy_particle_gc_vpar(particle_in, particle_out)
@@ -32,6 +46,120 @@ particle_out%B_norm= particle_in%B_norm
 
 return
 end
+
+! Preserve raw locator evidence, and only recover an independently inside point.
+! Geometry is built once by the caller outside particle/OpenMP loops.
+subroutine classify_gyro_point(nodes,elements,point,raw_status,result,geometry)
+use data_structure, only: type_node_list,type_element_list
+use mod_interp, only: interp_RZ
+use mod_find_rz_nearby, only: find_RZ_nearby
+use phys_module, only: find_RZ_nearby_tol
+use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
+implicit none
+type(type_node_list),intent(in)::nodes
+type(type_element_list),intent(in)::elements
+type(particle_kinetic_leapfrog),intent(inout)::point
+integer,intent(in)::raw_status
+type(gyro_point_result),intent(out)::result
+type(gc_boundary_geometry),optional,intent(in)::geometry
+integer::winding,e,status,e2
+real*8::r,z,s,t,rs,rt,zs,zt,s2,t2
+logical::ok
+result=gyro_point_result()
+result%locator_status=raw_status;result%locator_element=point%i_elm;result%locator_st=point%st
+if(.not.all(ieee_is_finite(point%x)))then
+  point%i_elm=0
+  return
+endif
+result%classification=GYRO_UNRESOLVED
+if(point%i_elm>0.and.point%i_elm<=elements%n_elements.and.all(ieee_is_finite(point%st)))then
+  if(minval(point%st)>=0.d0.and.maxval(point%st)<=1.d0)then
+    ! Ordinary successful locator retains its own convergence checks.
+    if(raw_status==0)then
+      result%classification=GYRO_VALID;result%element=point%i_elm
+      return
+    endif
+    if(valid_location(point%i_elm,point%st))then
+      result%classification=GYRO_FALLBACK;result%element=point%i_elm
+      return
+    endif
+  endif
+endif
+if(present(geometry))then
+  call boundary_winding(geometry,point%x(:2),winding,ok)
+  if(ok)then
+    if(winding==0)then
+      result%classification=GYRO_OUTSIDE
+      ! Negative metadata is evidence only; it is never a GC loss.
+      point%i_elm=min(0,point%i_elm)
+      result%element=point%i_elm
+      return
+    endif
+    if(winding==1)then
+      e=0
+      call find_RZ(nodes,elements,point%x(1),point%x(2),r,z,e,s,t,status)
+      if(e>0.and.e<=elements%n_elements.and.all(ieee_is_finite([s,t])))then
+        if(min(s,t)>=0.d0.and.max(s,t)<=1.d0)then
+          call interp_RZ(nodes,elements,e,s,t,r,rs,rt,z,zs,zt)
+          if(all(ieee_is_finite([r,z,rs,rt,zs,zt])).and.rs*zt-rt*zs>0.d0)then
+            call find_RZ_nearby(nodes,elements,r,z,s,t,e,point%x(1),point%x(2),s2,t2,e2,status)
+            if(valid_location(e2,[s2,t2]))then
+              point%i_elm=e2;point%st=[s2,t2]
+              result%classification=GYRO_FALLBACK;result%element=e2;result%recovered=.true.
+              return
+            endif
+          endif
+        endif
+      endif
+    endif
+  endif
+endif
+point%i_elm=0
+contains
+logical function valid_location(elm,st) result(valid)
+integer,intent(in)::elm
+real*8,intent(in)::st(2)
+real*8::rr,zz,a,b,c,d
+valid=.false.
+if(elm<=0.or.elm>elements%n_elements.or..not.all(ieee_is_finite(st)))return
+if(minval(st)<0.d0.or.maxval(st)>1.d0)return
+call interp_RZ(nodes,elements,elm,st(1),st(2),rr,a,b,zz,c,d)
+if(.not.all(ieee_is_finite([rr,zz,a,b,c,d])))return
+valid=a*d-b*c>0.d0.and.(rr-point%x(1))**2+(zz-point%x(2))**2<=find_RZ_nearby_tol
+end function
+end subroutine
+
+subroutine accumulate_gyro_status(ring,point)
+type(gyro_ring_result),intent(inout)::ring
+type(gyro_point_result),intent(in)::point
+select case(point%classification)
+case(GYRO_VALID,GYRO_FALLBACK);ring%n_valid=ring%n_valid+1
+case(GYRO_OUTSIDE);ring%n_outside=ring%n_outside+1
+case(GYRO_UNRESOLVED);ring%n_unresolved=ring%n_unresolved+1
+case default;ring%n_invalid=ring%n_invalid+1
+end select
+if(point%recovered)ring%n_recovered=ring%n_recovered+1
+end subroutine
+
+subroutine finish_gyro_status(ring,status)
+use mod_pusher_tools,only:GC_GEOMETRY_INVALID
+type(gyro_ring_result),intent(inout)::ring
+integer,intent(out)::status
+ring%classification=RING_FAILURE
+status=GYRO_LOCATION_FAILURE
+if(ring%n_invalid>0)then
+  status=GC_GEOMETRY_INVALID
+else if(ring%n_unresolved>0)then
+  return
+else if(ring%n_outside>0)then
+  status=-1
+  ring%classification=RING_PARTIAL_OUTSIDE
+  if(ring%n_valid==0)ring%classification=RING_OUTSIDE
+else if(ring%n_valid>0)then
+  status=0
+  ring%classification=RING_VALID
+endif
+end subroutine
 
 subroutine convert_gc_to_gc_vpar(particle_in, B_norm, mass, particle_out)
   implicit none
@@ -177,7 +305,7 @@ particle_out%weight= particle_in%weight
 return
 end
    
-subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, mass, n_phases, particle_out, my_ifail, gyro_phase)
+subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, mass, n_phases, particle_out, my_ifail, gyro_phase, point_results, ring_result, boundary_geometry)
   use constants
   use data_structure
   use mod_pusher_tools, only: get_orthonormals, larmor_displacement, cylindrical_displacement, &
@@ -197,11 +325,25 @@ subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, m
   integer, intent(out) :: my_ifail
   ! Optional deterministic phase in radians; absent retains exactly one RNG draw.
   real*8, optional, intent(in) :: gyro_phase
+  type(gyro_point_result), optional, intent(out) :: point_results(:)
+  type(gyro_ring_result), optional, intent(out) :: ring_result
+  type(gc_boundary_geometry), optional, intent(in) :: boundary_geometry
+  type(gyro_point_result) :: point
+  type(gyro_ring_result) :: ring
 
   real*8  :: B_norm, v_perp, v_par, B_hat(3), e1(3), e2(3), chi, chi_start
   real*8 :: rho(3), delta_phi, velocity_at_gc(3)
   integer :: i, ifail
 
+  if(present(ring_result))ring_result=gyro_ring_result()
+  if(present(point_results))then
+    point_results=gyro_point_result()
+    if(size(point_results)<max(1,n_phases))then
+      my_ifail=GC_GEOMETRY_INVALID
+      return
+    endif
+  endif
+  ring=gyro_ring_result()
   ifail = 0
   my_ifail = 0
 
@@ -216,6 +358,16 @@ subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, m
     particle_out(1)%i_elm  = particle_in%i_elm
     particle_out(1)%q      = particle_in%q
     particle_out(1)%weight = particle_in%weight
+    if(present(ring_result))then
+      ring_result%classification=RING_VALID
+      ring_result%n_valid=1
+    endif
+    if(present(point_results))then
+      point_results(1)%classification=GYRO_VALID
+      point_results(1)%element=particle_in%i_elm
+      point_results(1)%locator_element=particle_in%i_elm
+      point_results(1)%locator_st=particle_in%st
+    endif
     return
   endif
 
@@ -236,6 +388,7 @@ subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, m
     particle_out(i)%v = 0.d0
   enddo
   my_ifail = GC_GEOMETRY_INVALID
+  if(present(ring_result))ring_result%n_invalid=n_phases
   if (.not. all(ieee_is_finite(B)) .or. .not. ieee_is_finite(mass)) return
   if (.not. ieee_is_finite(particle_in%mu) .or. .not. ieee_is_finite(particle_in%vpar)) return
   if (.not. ieee_is_finite(chi_start) .or. mass <= 0.d0 .or. particle_in%mu < 0.d0) return
@@ -252,6 +405,7 @@ subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, m
 
   do i = 1, n_phases
     
+    ifail=0
     chi = chi_start + real(i-1,8) / real(n_phases,8) * TWOPI
 
     particle_out(i)%v  = particle_in%vpar * B_hat + v_perp * (cos(chi) * e1 + sin(chi) * e2)
@@ -265,6 +419,8 @@ subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, m
     if (ifail /= 0) then
       my_ifail = GC_GEOMETRY_INVALID
       particle_out(i)%i_elm = 0
+      ring%n_invalid=ring%n_invalid+1
+      if(present(point_results))point_results(i)=gyro_point_result()
       cycle
     endif
     particle_out(i)%v = vector_rotation(velocity_at_gc,-delta_phi)
@@ -273,12 +429,29 @@ subroutine convert_gc_vpar_to_kinetic(node_list, element_list, particle_in, B, m
           particle_in%x(1),particle_in%x(2),particle_in%st(1),particle_in%st(2),particle_in%i_elm, &
           particle_out(i)%x(1),particle_out(i)%x(2),particle_out(i)%st(1),particle_out(i)%st(2), &
           particle_out(i)%i_elm,ifail)
-      if (ifail /= 0 .and. my_ifail /= GC_GEOMETRY_INVALID) my_ifail = ifail
+
     else
       particle_out(i)%i_elm = particle_in%i_elm
     endif
-
+    if(ifail==0.and.particle_out(i)%i_elm>0)then
+      ! Ordinary convergence is already checked by find_RZ_nearby. Avoid an
+      ! exceptional-classifier call and unused record construction per point.
+      ring%n_valid=ring%n_valid+1
+      if(present(point_results))then
+        point_results(i)%classification=GYRO_VALID
+        point_results(i)%locator_status=ifail
+        point_results(i)%locator_element=particle_out(i)%i_elm
+        point_results(i)%locator_st=particle_out(i)%st
+        point_results(i)%element=particle_out(i)%i_elm
+      endif
+    else
+      call classify_gyro_point(node_list,element_list,particle_out(i),ifail,point,boundary_geometry)
+      if(present(point_results))point_results(i)=point
+      call accumulate_gyro_status(ring,point)
+    endif
   enddo
+  call finish_gyro_status(ring,my_ifail)
+  if(present(ring_result))ring_result=ring
 
 end subroutine convert_gc_vpar_to_kinetic
 
@@ -466,7 +639,7 @@ end
 
 subroutine push_gc_rk4(fields, particle_gc, mass, timestep, n_steps, n_gyro_phases, gyro_shift, lost_st, lost_phi, gyro_phase, wall_status, locator_retries, &
                        integration_substeps, start_time, failed_substep, failed_stage, stage_time, field_calls, &
-                       max_stage_distance, max_cell_distance, failure_reason)
+                       max_stage_distance, max_cell_distance, failure_reason, gyro_boundary)
 use nodes_elements
 use mod_pusher_tools, only: GC_GEOMETRY_INVALID
 use mod_find_rz_nearby
@@ -492,6 +665,8 @@ real*8, intent(in), optional :: start_time
 ! Stage-loss diagnostics identify the RK trial, not a continuous first impact.
 integer, intent(out), optional :: failed_substep, failed_stage, field_calls, failure_reason
 real*8, intent(out), optional :: stage_time, max_stage_distance, max_cell_distance
+type(gc_boundary_geometry), intent(in), optional :: gyro_boundary
+type(gyro_ring_result) :: gyro_result
 real*8, intent(in), optional :: gyro_phase ! Controlled quadrature offset; absent uses production RNG.
 
 real*8 :: A_0(3), dA_0(3,3), B_0(3), dB_0(3,3), bn_0, dbn_0(3), Bnorm_0(3), dBnorm_0(3,3), E_0(3)
@@ -565,9 +740,19 @@ call fields%calc_RK4(time_0, p_0%i_elm, p_0%st, p_0%x(3), A_0, dA_0, B_0, dB_0, 
 if(present(field_calls))field_calls=field_calls+1
 !call fields%calc_RK4_analytic(p_0%x(1), p_0%x(2), p_0%x(3), A_0, dA_0, B_0, dB_0, Bnorm_0, dBnorm_0, bn_0, dbn_0, E_0)
 
-call convert_gc_vpar_to_kinetic(node_list, element_list, p_0, B_0, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
-if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
-call fields%calc_gyro_average_E(time_0, p_orbit, n_gyro_phases, E_0)
+call convert_gc_vpar_to_kinetic(node_list, element_list, p_0, B_0, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase, ring_result=gyro_result, boundary_geometry=gyro_boundary)
+if(gyro_result%classification==RING_FAILURE.or.gyro_result%n_valid==0)then
+  if(present(failure_reason))failure_reason=5
+  if(present(failed_substep))failed_substep=i
+  if(present(failed_stage))failed_stage=current_stage
+  if(present(stage_time))stage_time=current_time
+  if(present(wall_status))then
+    wall_status=GC_NUMERICAL_FAILURE
+    return
+  endif
+  error stop 'Unresolved or empty ion gyro-ring; accepted GC retained'
+endif
+call gather_ion_common_basis(fields,time_0, p_orbit, n_gyro_phases, E_0, p_0%x(3))
 
 
   
@@ -599,9 +784,19 @@ call fields%calc_gyro_average_E(time_0, p_orbit, n_gyro_phases, E_0)
 if(present(field_calls))field_calls=field_calls+1
  !call fields%calc_RK4_analytic(p_1%x(1), p_1%x(2), p_1%x(3), A_1, dA_1, B_1, dB_1, Bnorm_1, dBnorm_1, bn_1, dbn_1, E_1)
 
-  call convert_gc_vpar_to_kinetic(node_list, element_list, p_1, B_1, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
-if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
-  call fields%calc_gyro_average_E(time_1, p_orbit, n_gyro_phases, E_1)
+  call convert_gc_vpar_to_kinetic(node_list, element_list, p_1, B_1, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase, ring_result=gyro_result, boundary_geometry=gyro_boundary)
+if(gyro_result%classification==RING_FAILURE.or.gyro_result%n_valid==0)then
+  if(present(failure_reason))failure_reason=5
+  if(present(failed_substep))failed_substep=i
+  if(present(failed_stage))failed_stage=current_stage
+  if(present(stage_time))stage_time=current_time
+  if(present(wall_status))then
+    wall_status=GC_NUMERICAL_FAILURE
+    return
+  endif
+  error stop 'Unresolved or empty ion gyro-ring; accepted GC retained'
+endif
+  call gather_ion_common_basis(fields,time_1, p_orbit, n_gyro_phases, E_1, p_1%x(3))
   
   call rk4_step(p_1%x, p_1%vpar, qom, p_1%mu, E_1, B_1, Bnorm_1, dBnorm_1, dBn_1, delta_x2, delta_u2)
 
@@ -630,9 +825,19 @@ if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
 if(present(field_calls))field_calls=field_calls+1
  !call fields%calc_RK4_analytic(p_2%x(1), p_2%x(2), p_2%x(3), A_2, dA_2, B_2, dB_2, Bnorm_2, dBnorm_2, bn_2, dbn_2, E_2)
             
-  call convert_gc_vpar_to_kinetic(node_list, element_list, p_2, B_2, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
-if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
-  call fields%calc_gyro_average_E(time_2, p_orbit, n_gyro_phases, E_2)
+  call convert_gc_vpar_to_kinetic(node_list, element_list, p_2, B_2, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase, ring_result=gyro_result, boundary_geometry=gyro_boundary)
+if(gyro_result%classification==RING_FAILURE.or.gyro_result%n_valid==0)then
+  if(present(failure_reason))failure_reason=5
+  if(present(failed_substep))failed_substep=i
+  if(present(failed_stage))failed_stage=current_stage
+  if(present(stage_time))stage_time=current_time
+  if(present(wall_status))then
+    wall_status=GC_NUMERICAL_FAILURE
+    return
+  endif
+  error stop 'Unresolved or empty ion gyro-ring; accepted GC retained'
+endif
+  call gather_ion_common_basis(fields,time_2, p_orbit, n_gyro_phases, E_2, p_2%x(3))
 
   call rk4_step(p_2%x, p_2%vpar, qom, p_2%mu, E_2, B_2, Bnorm_2, dBnorm_2, dBn_2, delta_x3, delta_u3)
 
@@ -662,9 +867,19 @@ if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
 if(present(field_calls))field_calls=field_calls+1
  !call fields%calc_RK4_analytic(p_3%x(1), p_3%x(2), p_3%x(3), A_3, dA_3, B_3, dB_3, Bnorm_3, dBnorm_3, bn_3, dbn_3, E_3)
     
-  call convert_gc_vpar_to_kinetic(node_list, element_list, p_3, B_3, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
-if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
-  call fields%calc_gyro_average_E(time_3, p_orbit, n_gyro_phases, E_3)
+  call convert_gc_vpar_to_kinetic(node_list, element_list, p_3, B_3, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase, ring_result=gyro_result, boundary_geometry=gyro_boundary)
+if(gyro_result%classification==RING_FAILURE.or.gyro_result%n_valid==0)then
+  if(present(failure_reason))failure_reason=5
+  if(present(failed_substep))failed_substep=i
+  if(present(failed_stage))failed_stage=current_stage
+  if(present(stage_time))stage_time=current_time
+  if(present(wall_status))then
+    wall_status=GC_NUMERICAL_FAILURE
+    return
+  endif
+  error stop 'Unresolved or empty ion gyro-ring; accepted GC retained'
+endif
+  call gather_ion_common_basis(fields,time_3, p_orbit, n_gyro_phases, E_3, p_3%x(3))
 
   call rk4_step(p_3%x, p_3%vpar, qom, p_3%mu, E_3, B_3, Bnorm_3, dBnorm_3, dBn_3, delta_x4, delta_u4)
                                 
@@ -698,9 +913,19 @@ call fields%calc_RK4(time_0, p_0%i_elm, p_0%st, p_0%x(3), A_0, dA_0, B_0, dB_0, 
 if(present(field_calls))field_calls=field_calls+1
 
 if (present(gyro_shift)) then
-  call convert_gc_vpar_to_kinetic(node_list, element_list, p_0, B_0, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase)
-if (ifail == GC_GEOMETRY_INVALID) error stop 'Invalid GC gyro-orbit geometry'
-  call fields%calc_gyro_average_E(time_0, p_orbit, n_gyro_phases, E_0)
+  call convert_gc_vpar_to_kinetic(node_list, element_list, p_0, B_0, mass, n_gyro_phases, p_orbit, ifail, gyro_phase=gyro_phase, ring_result=gyro_result, boundary_geometry=gyro_boundary)
+if(gyro_result%classification==RING_FAILURE.or.gyro_result%n_valid==0)then
+  if(present(failure_reason))failure_reason=5
+  if(present(failed_substep))failed_substep=i
+  if(present(failed_stage))failed_stage=current_stage
+  if(present(stage_time))stage_time=current_time
+  if(present(wall_status))then
+    wall_status=GC_NUMERICAL_FAILURE
+    return
+  endif
+  error stop 'Unresolved or empty ion gyro-ring; accepted GC retained'
+endif
+  call gather_ion_common_basis(fields,time_0, p_orbit, n_gyro_phases, E_0, p_0%x(3))
   gyro_shift = (E_0 - dot_product(E_0,B_0)*B_0/bn_0**2) / bn_0**2 * mass*ATOMIC_MASS_UNIT / EL_CHG
 endif
 
@@ -868,5 +1093,23 @@ real*8 :: Bn, v_E(3), v_gradB(3), v_curvature(3)
 
 return
 end
+
+
+! Candidate scope: concrete JOREK linear FE fields only. Preserve custom callbacks.
+subroutine gather_ion_common_basis(fields,time,points,n,E,phi)
+ use mod_fields, only: fields_base,calc_gyro_average_E_common
+ use mod_fields_linear, only: jorek_fields_interp_linear
+ class(fields_base),intent(in)::fields
+ real*8,intent(in)::time,phi
+ integer,intent(in)::n
+ type(particle_kinetic_leapfrog),intent(in)::points(n)
+ real*8,intent(inout)::E(3)
+ select type(fields)
+ type is(jorek_fields_interp_linear)
+  call calc_gyro_average_E_common(fields,time,points,n,E,phi)
+ class default
+  call fields%calc_gyro_average_E(time,points,n,E)
+ end select
+end subroutine gather_ion_common_basis
 
 end module
