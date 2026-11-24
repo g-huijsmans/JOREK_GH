@@ -986,6 +986,7 @@ module phys_module
   real*8  :: tstep_particles      !< the time step for the particles
   integer :: nstep_particles      !< the number of particle time steps (not used in kinetic_main)
   integer :: nsubstep_particles   !< the number of particles substeps (without projection) (not used in kinetic_main)
+character(len=16) :: gk_ion_boundary_policy = 'whole_ring' ! Provisional ion charge/force boundary policy
 integer :: nsubstep_gc_electrons ! RK4 orbit substeps; independent of field update cadence
   integer :: nsubstep_electrons   !< electron substeps per outer ion step in jorek_gk
   real*8  :: T_scale_factor       !< scale imported equilibrium temperature in jorek_gk

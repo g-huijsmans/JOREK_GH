@@ -30,6 +30,14 @@ module mod_gc_variational
   end type
 contains
 
+! Shared deposition decision; numerical/empty rings remain the caller's failure.
+logical function ion_ring_deposits(ring) result(accept)
+ use phys_module, only: gk_ion_boundary_policy
+ type(gyro_ring_result),intent(in)::ring
+ accept=ring%classification==RING_VALID
+ if(gk_ion_boundary_policy=='truncate')accept=accept.or.ring%classification==RING_PARTIAL_OUTSIDE
+end function ion_ring_deposits
+
 subroutine copy_particle_gc_vpar(particle_in, particle_out)
 implicit none
 type(particle_gc_vpar), intent(in)  :: particle_in
@@ -1097,6 +1105,7 @@ end
 
 ! Candidate scope: concrete JOREK linear FE fields only. Preserve custom callbacks.
 subroutine gather_ion_common_basis(fields,time,points,n,E,phi)
+ use phys_module, only: gk_ion_boundary_policy
  use mod_fields, only: fields_base,calc_gyro_average_E_common
  use mod_fields_linear, only: jorek_fields_interp_linear
  class(fields_base),intent(in)::fields
@@ -1106,9 +1115,13 @@ subroutine gather_ion_common_basis(fields,time,points,n,E,phi)
  real*8,intent(inout)::E(3)
  select type(fields)
  type is(jorek_fields_interp_linear)
-  call calc_gyro_average_E_common(fields,time,points,n,E,phi)
+  call calc_gyro_average_E_common(fields,time,points,n,E,phi,original_weights=gk_ion_boundary_policy=='truncate')
  class default
   call fields%calc_gyro_average_E(time,points,n,E)
+  if(gk_ion_boundary_policy=='truncate'.and.n>0)then
+    if(count(points%i_elm>0)>0.and.count(points%i_elm>0)<n) &
+      E=E*(real(count(points%i_elm>0),8)/real(n,8))
+  endif
  end select
 end subroutine gather_ion_common_basis
 

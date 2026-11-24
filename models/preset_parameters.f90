@@ -866,6 +866,7 @@ use_particles      = .false.
 nstep_particles    = 0
 nsubstep_particles = 1
   nsubstep_gc_electrons = 1
+  gk_ion_boundary_policy = 'whole_ring'
 nsubstep_electrons = 1
 tstep_particles    = 1d-9
 T_scale_factor     = 1.d0

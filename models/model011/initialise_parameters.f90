@@ -19,7 +19,7 @@ real*8 :: vacuum_fraction, b_over_a, a_over_b
 integer :: ierr,err,i
 
 ! --- Namelist with input parameters.
-namelist /in1/  reflect_gk_neutrals, use_gk_neutral_ionization, n_update_ionization_profiles, &
+namelist /in1/  gk_ion_boundary_policy, reflect_gk_neutrals, use_gk_neutral_ionization, n_update_ionization_profiles, &
                 gk_ionization_diagnostics, gk_ionization_outside_gc_action, gk_ionization_rejection_diagnostics, &
                 gk_ionization_adas_suffix, gk_ionization_adas_directory, &
                 tstep, nstep, tstep_n, nstep_n,                     &

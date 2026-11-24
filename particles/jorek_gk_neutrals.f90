@@ -50,6 +50,7 @@ use basis_at_gaussian
 use mod_normalisations
 use phys_module, only: F0, tstep, nstep, nout, restart, rho_0, rho_1, rho_coef
 use phys_module, only: CENTRAL_MASS, CENTRAL_DENSITY, xcase, xpoint, index_now, index_start
+use phys_module, only: gk_ion_boundary_policy
 use phys_module, only: nstep_particles, nsubstep_particles, tstep_particles, nsubstep_electrons, nsubstep_gc_electrons
 use phys_module, only: part_group_configs, n_part_groups
 use phys_module, only: filter_perp, filter_hyper, filter_par, filter_perp_n0, filter_hyper_n0, filter_par_n0
@@ -159,6 +160,14 @@ neutral_group  = 3
 !call sim%initialize(skip_group_config =.true.) 
 call sim%initialize()  
 call tr_meminit(sim%my_id, sim%n_mpi)
+
+select case(trim(gk_ion_boundary_policy))
+case('whole_ring','truncate')
+  if(sim%my_id==0)write(*,*)'GK ion boundary policy: ',trim(gk_ion_boundary_policy)
+case default
+  if(sim%my_id==0)write(*,*)'ERROR: gk_ion_boundary_policy must be whole_ring or truncate'
+  call MPI_ABORT(MPI_COMM_WORLD,1,ierr)
+end select
 
 if (nsubstep_gc_electrons < 1) then
   if(sim%my_id==0)write(*,*)'ERROR: nsubstep_gc_electrons must be at least one'
@@ -932,9 +941,9 @@ use mod_particle_types, only: particle_gc_vpar, particle_kinetic_leapfrog, copy_
 use mod_event
 use mod_pcg32_rng
 use mod_interp, only: mode_moivre, interp_RZ, interp_0
-use phys_module, only: nsubstep_gc_electrons
+use phys_module, only: nsubstep_gc_electrons, gk_ion_boundary_policy
 use mod_gc_variational, only : convert_gc_vpar_to_kinetic, copy_particle_gc_vpar, push_gc_rk4, GC_NUMERICAL_FAILURE, &
-    gyro_ring_result, RING_FAILURE, RING_VALID
+    gyro_ring_result, RING_FAILURE, RING_VALID, ion_ring_deposits
 use mod_gk_gc_boundary, only: gc_boundary_geometry, build_gc_boundary_geometry
 use constants,   only: MU_ZERO, ATOMIC_MASS_UNIT, K_BOLTZ, EL_CHG
 use phys_module, only: F0, CENTRAL_MASS, CENTRAL_DENSITY, ei_small_angle_scattering_Orb5, ei_small_angle_scattering_Lu
@@ -1149,7 +1158,7 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
 
     call convert_gc_vpar_to_kinetic(sim%fields%node_list, sim%fields%element_list, particle_tmp, B, sim%groups(i_group)%mass, n_phases, p_orbit, ifail, &
          ring_result=gyro_result, boundary_geometry=gyro_boundary)
-    if(gyro_result%classification==RING_FAILURE)then
+    if(gyro_result%classification==RING_FAILURE.or.gyro_result%n_valid==0)then
       gc_failures=gc_failures+1
       !$omp critical(gc_failure_report)
       write(*,*) 'Unresolved ion deposition ring rank/group/slot: ',sim%my_id,i_group,j
@@ -1157,9 +1166,9 @@ if (sim%my_id .eq. 0) write(*,*) 'starting loop gc : ',size(particles,1), n_orbi
       cycle
     endif
     if(i_group==ion_group)call copy_particle_gc_vpar(particle_tmp,particles(j))
-    ! Interim policy: omit the WHOLE ring when any sampled point is confirmed
-    ! outside. This fixes the old order-dependent guard; it is not an FLR wall law.
-    if(gyro_result%classification/=RING_VALID)cycle
+    ! Both policies retain original point weights; the final scatter divides by N.
+    ! Whole-ring omission is the default. Truncate retains confirmed interior points.
+    if(.not.ion_ring_deposits(gyro_result))cycle
         
     n_valid_phases = 0
     v_par_sum  = 0.d0

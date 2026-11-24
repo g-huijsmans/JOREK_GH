@@ -542,7 +542,7 @@ subroutine calc_gyro_average_E(fields, time, particles, n_phases, E_average)
 end subroutine calc_gyro_average_E
 
 ! Candidate: average physical vectors in the specified guiding-centre basis.
-subroutine calc_gyro_average_E_common(fields, time, particles, n_phases, E_average, reference_phi, status)
+subroutine calc_gyro_average_E_common(fields, time, particles, n_phases, E_average, reference_phi, status, original_weights)
   use phys_module, only: F0, mode, central_mass, central_density
   use constants, only: mu_zero, atomic_mass_unit
   use mod_coordinate_transforms, only: vector_rotation
@@ -555,6 +555,7 @@ subroutine calc_gyro_average_E_common(fields, time, particles, n_phases, E_avera
   real*8, intent(inout)                      :: E_average(3) !< Electric field [V/m]
   real*8, optional, intent(in) :: reference_phi
   integer, optional, intent(out) :: status
+  logical, optional, intent(in) :: original_weights
   ! Internal parameters
   integer, parameter :: i_var(1) = [2]
   real*8             :: P(1), P_s(1), P_t(1), P_phi(1), P_time(1) ! Placeholder for evaluating variables and derivatives locally
@@ -612,6 +613,10 @@ subroutine calc_gyro_average_E_common(fields, time, particles, n_phases, E_avera
 
   enddo
 
+  ! Empty positive-N rings returned above; never manufacture a zero-field push.
+  if(present(original_weights))then
+    if(original_weights)n_average=n_phases
+  endif
   E_average = E_average / real(n_average,8)
 
 end subroutine calc_gyro_average_E_common
